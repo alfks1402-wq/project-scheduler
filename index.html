@@ -19,11 +19,14 @@
   .sidebar-nav button { text-align: left; padding: 9px 10px; border: none; background: transparent; color: #d1d5db; border-radius: 6px; cursor: pointer; font-size: 14px; }
   .sidebar-nav button:hover { background: #1f2937; }
   .sidebar-nav button.active { background: #2563eb; color: #fff; }
-  .main-content { flex: 1; min-width: 0; padding: 20px 24px; max-width: 1200px; }
+  .main-content { flex: 1; min-width: 0; padding: 20px 24px; }
   .main-header { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 18px; }
   .main-header h1 { font-size: 19px; margin: 0 0 4px; }
   .main-sub { font-size: 13px; color: #6b7280; margin: 0; }
   .user-tag { font-size: 13px; color: #6b7280; }
+  .online-users { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+  .online-pill { background: #dcfce7; color: #15803d; border-radius: 999px; padding: 3px 10px; font-size: 12px; font-weight: 500; }
+  .online-pill.dim { background: #f3f4f6; color: #9ca3af; }
 
   .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 16px; }
   .stat-card { background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 14px 16px; }
@@ -99,12 +102,14 @@
   .modal-actions .primary:disabled { background: #9ca3af; border-color: #9ca3af; cursor: not-allowed; }
   .modal-actions .danger { color: #dc2626; }
 
-  .gantt-wrap { border: 1px solid #d1d5db; overflow-x: auto; margin-top: 8px; }
-  .gantt-table { display: grid; grid-template-columns: 180px 1fr; min-width: 720px; }
+  .gantt-wrap { border: 1px solid #d1d5db; margin-top: 8px; }
+  .gantt-table { display: grid; grid-template-columns: 180px 1fr; }
   .gantt-head-label { border-bottom: 1px solid #d1d5db; background: #f3f4f6; }
   .gantt-head-timeline { position: relative; height: 26px; border-bottom: 1px solid #d1d5db; background: #f3f4f6; }
   .gantt-tick { position: absolute; top: 4px; font-size: 10px; color: #9ca3af; }
   .gantt-row-label { padding: 5px 8px; font-size: 12px; border-bottom: 1px solid #e5e7eb; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+  .gantt-row-label .drag-handle { cursor: grab; color: #9ca3af; margin-right: 4px; }
+  .gantt-row-label.drag-over { background: #eff6ff; box-shadow: inset 0 2px 0 #2563eb; }
   .gantt-row-label:hover { background: #eff6ff; }
   .gantt-row-timeline { position: relative; height: 28px; border-bottom: 1px solid #e5e7eb; }
   .gantt-bar { position: absolute; top: 4px; height: 20px; border-radius: 4px; color: #fff; font-size: 11px; padding: 0 6px; overflow: hidden; white-space: nowrap; cursor: pointer; }
@@ -135,6 +140,7 @@ firebase.initializeApp(firebaseConfig);
 const db = firebase.firestore();
 const tasksCol = db.collection("tasks");
 const kpiCol = db.collection("kpiProjects");   // 간트차트 전용 (일정 목록/달력과 별개) - 프로젝트마다 여러 단계를 가짐
+const presenceCol = db.collection("presence"); // 현재 접속 중인 사용자 표시용
 const FIXED_GANTT_ITEMS = [
   "프로젝트 착수", "요구사항 분석 및 정의", "업무 정의 및 설계", "개발환경 분석 및 확정",
   "서비스 기능 정의", "화면설계", "개발", "테스트서버 검수", "오픈", "모니터링 및 오류 개선",
@@ -174,16 +180,42 @@ if (!userName) {
   localStorage.setItem("scheduler_user", userName);
 }
 
+/* ===== 현재 접속 중인 사용자 표시 ===== */
+let sessionId = localStorage.getItem("scheduler_session_id");
+if (!sessionId) {
+  sessionId = "sess_" + Math.random().toString(36).slice(2, 10);
+  localStorage.setItem("scheduler_session_id", sessionId);
+}
+const PRESENCE_TTL_MS = 45000;
+function pingPresence() {
+  presenceCol.doc(sessionId).set({ name: userName, lastSeen: Date.now() }).catch(() => {});
+}
+pingPresence();
+setInterval(pingPresence, 20000);
+window.addEventListener("beforeunload", () => { presenceCol.doc(sessionId).delete().catch(() => {}); });
+let onlineUsers = [];
+presenceCol.onSnapshot((snap) => {
+  onlineUsers = snap.docs
+    .map((d) => d.data())
+    .filter((u) => Date.now() - u.lastSeen < PRESENCE_TTL_MS);
+  render();
+});
+
 /* ===== 전역 상태 ===== */
 let tasks = [];
-let tab = "dashboard";
+let tab = localStorage.getItem("scheduler_tab") || "dashboard";
 let now = new Date();
 let ym = { year: now.getFullYear(), month: now.getMonth() };
 let summaryYear = now.getFullYear();   // 대시보드 월별 집계표에서 조회 중인 연도
+let ganttYear = now.getFullYear();     // 장기 프로젝트 관리 탭에서 조회 중인 연도
 let modal = null;
 let kpiProjects = [];   // [{ id, name, stages: [{label, kpiName, start, end}, ...] }, ...]
 let kpiModal = null;    // { projectId, stageIdx }
+let newProjectModal = false;   // 새 프로젝트 추가 팝업 (프로젝트명 + 기본단계 일자)
 let listFilter = { status: "전체", keyword: "" };
+let listYear = "전체";
+let listPage = 1;
+const LIST_PAGE_SIZE = 50;
 
 /* ===== Firestore 실시간 구독 ===== */
 tasksCol.onSnapshot((snap) => {
@@ -210,6 +242,7 @@ kpiCol.onSnapshot((snap) => {
 })();
 
 /* ===== 편집 잠금 ===== */
+let lockHeartbeat = null;
 function isLocked(task) {
   return task.editingBy && task.editingBy !== userName && task.editingAt &&
     (Date.now() - task.editingAt) < LOCK_TTL_MS;
@@ -218,10 +251,21 @@ async function acquireLock(task) {
   const fresh = tasks.find((t) => t.id === task.id);
   if (fresh && isLocked(fresh)) return false;
   await tasksCol.doc(task.id).update({ editingBy: userName, editingAt: Date.now() });
+  startLockHeartbeat(task.id);
   return true;
 }
 async function releaseLock(taskId) {
+  stopLockHeartbeat();
   await tasksCol.doc(taskId).update({ editingBy: firebase.firestore.FieldValue.delete(), editingAt: firebase.firestore.FieldValue.delete() });
+}
+function startLockHeartbeat(taskId) {
+  stopLockHeartbeat();
+  lockHeartbeat = setInterval(() => {
+    tasksCol.doc(taskId).update({ editingAt: Date.now() }).catch(() => {});
+  }, 20000);
+}
+function stopLockHeartbeat() {
+  if (lockHeartbeat) { clearInterval(lockHeartbeat); lockHeartbeat = null; }
 }
 
 /* ===== 대시보드 집계 (월 귀속 기준: 요청일자) ===== */
@@ -262,7 +306,7 @@ async function exportWeeklyReport() {
       cell.border = BORDER;
       const m = Array.isArray(mode) ? mode[colNumber - 1] : mode;
       if (m === "title") { cell.font = { bold: true }; cell.fill = HEADER_FILL; cell.alignment = CENTER; }
-      else if (m === "label") { cell.font = { bold: true }; }
+      else if (m === "label") { cell.font = { bold: true }; cell.fill = HEADER_FILL; }
     });
     return row;
   }
@@ -290,12 +334,12 @@ async function exportWeeklyReport() {
   }
 
   const sSheet = wb.addWorksheet("요약");
-  addRow(sSheet, ["이번 달 현황", `${thisMonth.month.slice(0, 4)}년 ${Number(thisMonth.month.slice(5, 7))}월`], "label");
-  addRow(sSheet, ["개발요청건", thisMonth.requested], ["label", "plain"]);
-  addRow(sSheet, ["진행중", thisMonth.delayed ? `${thisMonth.inProgress} (지연 ${thisMonth.delayed})` : thisMonth.inProgress], ["label", "plain"]);
-  addRow(sSheet, ["완료건", thisMonth.done], ["label", "plain"]);
-  addRow(sSheet, ["완료율", `${thisMonth.doneRate}%`], ["label", "plain"]);
-  addRow(sSheet, ["진행률", `${thisMonth.progressRate}%`], ["label", "plain"]);
+  addRow(sSheet, ["이번 달 현황", `${thisMonth.month.slice(0, 4)}년 ${Number(thisMonth.month.slice(5, 7))}월`], "title");
+  addRow(sSheet, ["개발요청건", thisMonth.requested], ["title", "plain"]);
+  addRow(sSheet, ["진행중", thisMonth.delayed ? `${thisMonth.inProgress} (지연 ${thisMonth.delayed})` : thisMonth.inProgress], ["title", "plain"]);
+  addRow(sSheet, ["완료건", thisMonth.done], ["title", "plain"]);
+  addRow(sSheet, ["완료율", `${thisMonth.doneRate}%`], ["title", "plain"]);
+  addRow(sSheet, ["진행률", `${thisMonth.progressRate}%`], ["title", "plain"]);
   sSheet.addRow([]);
 
   let lastYear = "";
@@ -353,30 +397,39 @@ function excelDateToStr(v) {
   const m = s.match(/(\d{4})[.\-\/](\d{1,2})[.\-\/](\d{1,2})/);
   return m ? `${m[1]}-${String(m[2]).padStart(2, "0")}-${String(m[3]).padStart(2, "0")}` : s;
 }
+function normHeader(s) { return String(s).replace(/\s+/g, ""); }
+const NORM_IMPORT_MAP = {};
+Object.entries(IMPORT_COLUMN_MAP).forEach(([k, v]) => { NORM_IMPORT_MAP[normHeader(k)] = v; });
 function taskSignature(rec) {
-  return rec.docNo ? `doc:${rec.docNo}` : `keys:${rec.reqDate}|${rec.title}|${rec.reqDept}`;
+  // 관련 문서번호는 실제 데이터에서 '내부개선', 'KPI'처럼 분류 태그로 재사용되는 경우가 많아
+  // 고유 식별자로 신뢰할 수 없음 - 여러 항목을 조합해서 중복 여부를 판단
+  return `${rec.reqDate || ""}|${rec.reqDept || ""}|${rec.requester || ""}|${rec.title || ""}|${rec.serviceCode || ""}`;
 }
-async function handleImportFile(file) {
-  const buf = await file.arrayBuffer();
-  const wb = XLSX.read(buf, { type: "array" });
-  const sheet = wb.Sheets[wb.SheetNames[0]];
-  const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
-  const headerRowIdx = rows.findIndex((r) => r.some((c) => String(c).trim() === "요청일자"));
-  if (headerRowIdx === -1) { alert("엑셀 안에서 '요청일자' 컬럼을 찾지 못했어요. 파일 형식을 확인해주세요."); return; }
+function buildEffectiveHeader(rows, headerRowIdx) {
   const headerRow = rows[headerRowIdx];
+  return headerRow.map((cell, colIdx) => {
+    if (String(cell).trim()) return cell;
+    for (let r = headerRowIdx - 1; r >= 0; r--) {
+      const v = rows[r]?.[colIdx];
+      if (v && String(v).trim()) return v;
+    }
+    return cell;
+  });
+}
+function extractRecordsFromSheet(sheet) {
+  const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
+  const headerRowIdx = rows.findIndex((r) => r.some((c) => normHeader(c) === "요청일자"));
+  if (headerRowIdx === -1) return [];
+  const headerRow = buildEffectiveHeader(rows, headerRowIdx);
   const dataRows = rows.slice(headerRowIdx + 1).filter((r) => r.some((c) => c !== ""));
 
-  const existingSigs = new Set(tasks.map(taskSignature));
-  const batch = db.batch();
-  let count = 0;
-  let skipped = 0;
-  dataRows.forEach((row) => {
+  return dataRows.map((row) => {
     const rec = {};
     headerRow.forEach((h, i) => {
-      const key = IMPORT_COLUMN_MAP[String(h).trim()];
+      const key = NORM_IMPORT_MAP[normHeader(h)];
       if (key) rec[key] = row[i] ?? "";
     });
-    if (!rec.reqDate && !rec.serviceName && !rec.reqContent) return;
+    if (!rec.reqDate && !rec.serviceName && !rec.reqContent) return null;
     const dateFields = ["reqDate", "cfDate", "meetingDate", "applyDate"];
     dateFields.forEach((k) => { if (rec[k]) rec[k] = excelDateToStr(rec[k]); });
     Object.keys(rec).forEach((k) => {
@@ -391,16 +444,49 @@ async function handleImportFile(file) {
     rec.screenDesign = rec.screenDesign || "없음";
     rec.cfRequest = rec.cfRequest || "N";
     rec.status = rec.status || "진행";
+    return rec;
+  }).filter(Boolean);
+}
+async function deleteAllTasks() {
+  const targets = getFilteredTasks();
+  if (targets.length === 0) { alert("삭제할 일정이 없습니다."); return; }
+  const scopeDesc = (listFilter.status === "전체" && !listFilter.keyword && listYear === "전체")
+    ? "전체"
+    : `현재 조회 조건(${listYear === "전체" ? "전체 연도" : listYear + "년"} / ${listFilter.status}${listFilter.keyword ? ` / "${listFilter.keyword}" 검색` : ""})에 해당하는`;
+  if (!confirm(`${scopeDesc} 일정 ${targets.length}건을 전부 삭제할까요?\n이 작업은 되돌릴 수 없습니다.`)) return;
+  const CHUNK = 400;
+  for (let i = 0; i < targets.length; i += CHUNK) {
+    const batch = db.batch();
+    targets.slice(i, i + CHUNK).forEach((t) => batch.delete(tasksCol.doc(t.id)));
+    await batch.commit();
+  }
+  alert(`${targets.length}건을 삭제했습니다.`);
+}
+async function handleImportFile(file) {
+  const buf = await file.arrayBuffer();
+  const wb = XLSX.read(buf, { type: "array" });
 
+  let allRecs = [];
+  wb.SheetNames.forEach((name) => { allRecs = allRecs.concat(extractRecordsFromSheet(wb.Sheets[name])); });
+  if (allRecs.length === 0) { alert("엑셀 안에서 '요청일자' 컬럼을 찾지 못했어요. 파일 형식을 확인해주세요."); return; }
+
+  const existingSigs = new Set(tasks.map(taskSignature));
+  const toAdd = [];
+  let skipped = 0;
+  allRecs.forEach((rec) => {
     const sig = taskSignature(rec);
     if (existingSigs.has(sig)) { skipped++; return; }
     existingSigs.add(sig);
-    batch.set(tasksCol.doc(), rec);
-    count++;
+    toAdd.push(rec);
   });
-  if (count === 0 && skipped === 0) { alert("불러올 데이터가 없습니다."); return; }
-  if (count > 0) await batch.commit();
-  alert(`${count}건의 일정을 등록했습니다.${skipped > 0 ? `\n(중복으로 판단되어 ${skipped}건은 건너뛰었습니다)` : ""}`);
+
+  const CHUNK = 400;   // Firestore 배치는 최대 500건, 여유있게 400건씩 나눠 커밋
+  for (let i = 0; i < toAdd.length; i += CHUNK) {
+    const batch = db.batch();
+    toAdd.slice(i, i + CHUNK).forEach((rec) => batch.set(tasksCol.doc(), rec));
+    await batch.commit();
+  }
+  alert(`${toAdd.length}건의 일정을 등록했습니다.${skipped > 0 ? `\n(중복으로 판단되어 ${skipped}건은 건너뛰었습니다)` : ""}`);
 }
 
 /* ===== 렌더링 ===== */
@@ -410,15 +496,26 @@ function render() {
     ? { id: activeEl.id, start: activeEl.selectionStart, end: activeEl.selectionEnd }
     : null;
 
+  // 팝업이 열려있는 동안 다른 사람의 변경사항 등으로 인한 재렌더링이 일어나도,
+  // 아직 저장하지 않은 입력값이 지워지지 않도록 현재 입력값을 미리 스냅샷으로 저장
+  const MODAL_FIELD_IDS = ["f_title","f_reqDept","f_requester","f_reqDate","f_reqMeeting","f_reqContent","f_docNo",
+    "f_serviceCode","f_serviceName","f_service","f_serviceCustom","f_devDept","f_devDeptCustom","f_devMeeting",
+    "f_workDesign","f_screenDesign","f_cfRequest","f_cfNo","f_cfDate","f_meetingDate","f_applyDate","f_status","f_memo"];
+  const KPI_FIELD_IDS = ["k_label", "k_kpiName", "k_start", "k_end"];
+  const fieldDraft = {};
+  if (modal) MODAL_FIELD_IDS.forEach((id) => { const el = document.getElementById(id); if (el) fieldDraft[id] = el.value; });
+  if (kpiModal) KPI_FIELD_IDS.forEach((id) => { const el = document.getElementById(id); if (el) fieldDraft[id] = el.value; });
+  if (newProjectModal) document.querySelectorAll('[id^="np_"]').forEach((el) => { fieldDraft[el.id] = el.value; });
+
   const root = document.getElementById("root");
   root.innerHTML = `
     <aside class="sidebar">
       <div class="sidebar-logo">프로젝트 일정관리</div>
       <nav class="sidebar-nav">
         <button data-tab="dashboard" class="${tab === "dashboard" ? "active" : ""}">대시보드</button>
-        <button data-tab="calendar" class="${tab === "calendar" ? "active" : ""}">달력</button>
-        <button data-tab="gantt" class="${tab === "gantt" ? "active" : ""}">장기 프로젝트 관리</button>
         <button data-tab="list" class="${tab === "list" ? "active" : ""}">목록</button>
+        <button data-tab="gantt" class="${tab === "gantt" ? "active" : ""}">장기 프로젝트 관리</button>
+        <button data-tab="calendar" class="${tab === "calendar" ? "active" : ""}">달력</button>
       </nav>
     </aside>
     <main class="main-content">
@@ -427,16 +524,27 @@ function render() {
           <h1>${tab === "dashboard" ? "대시보드" : tab === "calendar" ? "달력" : tab === "gantt" ? "장기 프로젝트 관리" : "목록"}</h1>
           <p class="main-sub">${fmt(new Date())} 기준</p>
         </div>
-        <span class="user-tag">${userName} 님</span>
+        <div style="display:flex; align-items:center; gap:12px;">
+          <div class="online-users" title="현재 접속 중">
+            ${onlineUsers.map((u) => `<span class="online-pill">${u.name}</span>`).join("") || `<span class="online-pill dim">접속자 없음</span>`}
+          </div>
+          <span class="user-tag">${userName} 님</span>
+        </div>
       </header>
       <input type="file" id="importFile" accept=".xlsx,.xls" style="display:none;" />
       <div id="tabContent"></div>
       ${modal ? renderModal() : ""}
       ${kpiModal ? renderKpiModal() : ""}
+      ${newProjectModal ? renderNewProjectModal() : ""}
     </main>
   `;
 
-  document.querySelectorAll(".sidebar-nav button").forEach((b) => b.onclick = () => { tab = b.dataset.tab; render(); });
+  document.querySelectorAll(".sidebar-nav button").forEach((b) => b.onclick = () => {
+    tab = b.dataset.tab;
+    localStorage.setItem("scheduler_tab", tab);
+    window.scrollTo(0, 0);
+    render();
+  });
 
   const tabRoot = document.getElementById("tabContent");
   if (tab === "dashboard") tabRoot.innerHTML = renderDashboard();
@@ -447,6 +555,15 @@ function render() {
   bindTabEvents();
   if (modal) bindModalEvents();
   if (kpiModal) bindKpiModalEvents();
+  if (newProjectModal) bindNewProjectModalEvents();
+
+  Object.entries(fieldDraft).forEach(([id, val]) => {
+    const el = document.getElementById(id);
+    if (el && el.value !== val) {
+      el.value = val;
+      if (id === "f_service" || id === "f_devDept") el.dispatchEvent(new Event("change"));
+    }
+  });
 
   if (focusInfo) {
     const el = document.getElementById(focusInfo.id);
@@ -457,6 +574,7 @@ function render() {
       }
     }
   }
+  maybeRestoreScroll();
 }
 
 function statCard(label, value, red, note) {
@@ -482,7 +600,6 @@ function renderDashboard() {
 
   return `
     <div style="display:flex; justify-content:flex-end; gap:8px; margin-bottom:14px;">
-      <button id="importBtn">엑셀 일괄등록</button>
       <button id="exportBtn">엑셀 다운로드</button>
     </div>
     <div class="stat-grid">
@@ -517,6 +634,29 @@ function renderDashboard() {
                 </td>
                 <td>${m.progressRate}%</td>
               </tr>`).join("") || `<tr><td colspan="7">${summaryYear}년 데이터가 없습니다.</td></tr>`}
+            ${monthlyForYear.length > 0 ? (() => {
+              const tReq = monthlyForYear.reduce((s, m) => s + m.requested, 0);
+              const tProg = monthlyForYear.reduce((s, m) => s + m.inProgress, 0);
+              const tDelay = monthlyForYear.reduce((s, m) => s + m.delayed, 0);
+              const tDone = monthlyForYear.reduce((s, m) => s + m.done, 0);
+              const tDoneRate = tReq ? Math.round((tDone / tReq) * 100) : 0;
+              const tProgRate = tReq ? Math.round((tProg / tReq) * 100) : 0;
+              return `
+              <tr style="font-weight:600; background:#f3f4f6;">
+                <td>합계</td>
+                <td>${tReq}</td>
+                <td style="color:#2563eb;">${tProg}</td>
+                <td style="color:${tDelay > 0 ? "#dc2626" : "inherit"};">${tDelay}</td>
+                <td>${tDone}</td>
+                <td style="text-align:left;">
+                  <div class="rate-cell">
+                    <div class="rate-bar"><div class="rate-bar-fill" style="width:${tDoneRate}%;"></div></div>
+                    <span class="rate-text">${tDoneRate}%</span>
+                  </div>
+                </td>
+                <td>${tProgRate}%</td>
+              </tr>`;
+            })() : ""}
           </tbody>
         </table>
       </div>
@@ -555,8 +695,10 @@ function renderCalendar() {
   const dows = ["일","월","화","수","목","금","토"];
   const byDate = {};
   tasks.forEach((t) => {
-    if (t.reqDate) (byDate[t.reqDate] ??= []).push({ task: t, color: STATUS_COLORS[t.status] || "#6b7280", tag: "" });
-    if (t.status === "완료" && t.applyDate) (byDate[t.applyDate] ??= []).push({ task: t, color: "#f59e0b", tag: "[완료] " });
+    const isDone = String(t.status || "").trim() === "완료";
+    const sameDayDone = isDone && t.applyDate && t.applyDate === t.reqDate;
+    if (t.reqDate && !sameDayDone) (byDate[t.reqDate] ??= []).push({ task: t, color: STATUS_COLORS[t.status] || "#6b7280", tag: "" });
+    if (isDone && t.applyDate) (byDate[t.applyDate] ??= []).push({ task: t, color: STATUS_COLORS["완료"], tag: "[완료] " });
   });
   return `
     <header class="cal-header">
@@ -564,7 +706,7 @@ function renderCalendar() {
       <strong>${ym.year}년 ${ym.month + 1}월</strong>
       <button id="nextM">▶</button>
     </header>
-    <p style="font-size:12px; color:#6b7280; margin:4px 0;">파란색/빨간색/초록색: 요청일자 기준 (진행/지연/완료) &nbsp;·&nbsp; 주황색: 완료 건의 적용일자</p>
+    <p style="font-size:12px; color:#6b7280; margin:4px 0;">파란색/빨간색/초록색: 요청일자 기준 (진행/지연/완료) &nbsp;·&nbsp; [완료] 초록색: 완료 건의 적용일자</p>
     <div class="cal-grid">
       ${dows.map((d) => `<div class="cal-dow">${d}</div>`).join("")}
       ${grid.map((c) => `
@@ -577,19 +719,12 @@ function renderCalendar() {
     </div>`;
 }
 
-function renderOneGantt(project) {
+function renderOneGantt(project, year) {
   const stages = project.stages || [];
-  const entries = stages.filter((v) => v.start && v.end);
   const today = fmt(new Date());
-  let rangeStart, rangeEnd;
-  if (entries.length) {
-    rangeStart = entries.reduce((min, v) => (v.start < min ? v.start : min), entries[0].start);
-    rangeEnd = entries.reduce((max, v) => (v.end > max ? v.end : max), entries[0].end);
-  } else {
-    rangeStart = today;
-    rangeEnd = fmt(new Date(new Date().setDate(new Date().getDate() + 55)));
-  }
-  const totalDays = Math.max(dateDiffDays(rangeStart, rangeEnd) + 1, 7);
+  const rangeStart = `${year}-01-01`;
+  const rangeEnd = `${year}-12-31`;
+  const totalDays = dateDiffDays(rangeStart, rangeEnd) + 1;
   const weekCount = Math.ceil(totalDays / 7);
   const gridDays = weekCount * 7;
 
@@ -605,23 +740,28 @@ function renderOneGantt(project) {
     else monthGroups.push({ month: w.month, count: 1 });
   });
 
-  const todayInRange = today >= rangeStart && today <= fmt(new Date(new Date(rangeStart).setDate(new Date(rangeStart).getDate() + gridDays - 1)));
+  const todayInRange = today >= rangeStart && today <= rangeEnd;
   const todayLeft = todayInRange ? dateDiffDays(rangeStart, today) / gridDays * 100 : null;
   const todayLine = todayLeft !== null ? `<div class="gantt-today" style="left:${todayLeft}%;"></div>` : "";
 
   const rows = stages.map((item, idx) => {
     const hasRange = item.start && item.end;
     const labelHtml = `${item.label}${item.kpiName ? `<br><span style="color:#6b7280; font-weight:400;">KPI: ${item.kpiName}</span>` : ""}`;
-    let bar;
+    let bar = "";
     if (hasRange) {
-      const left = dateDiffDays(rangeStart, item.start) / gridDays * 100;
-      const width = Math.max((dateDiffDays(item.start, item.end) + 1) / gridDays * 100, 100 / gridDays);
-      bar = `<div class="gantt-bar" data-project="${project.id}" data-idx="${idx}" style="left:${left}%; width:${width}%; background:#2563eb;" title="${item.label} (${item.start} ~ ${item.end})">${item.label}</div>`;
+      const clipStart = item.start < rangeStart ? rangeStart : item.start;
+      const clipEnd = item.end > rangeEnd ? rangeEnd : item.end;
+      if (clipStart <= clipEnd) {
+        const left = dateDiffDays(rangeStart, clipStart) / gridDays * 100;
+        const width = Math.max((dateDiffDays(clipStart, clipEnd) + 1) / gridDays * 100, 100 / gridDays);
+        bar = `<div class="gantt-bar" data-project="${project.id}" data-idx="${idx}" style="left:${left}%; width:${width}%; background:#2563eb;" title="${item.label} (${item.start} ~ ${item.end})">${item.label}</div>`;
+      }
     } else {
       bar = `<div class="gantt-bar unset" data-project="${project.id}" data-idx="${idx}" style="left:0; width:100%;" title="클릭해서 기간을 설정하세요">기간 미설정 (클릭해서 설정)</div>`;
     }
     return `
-      <div class="gantt-row-label" data-project="${project.id}" data-idx="${idx}">
+      <div class="gantt-row-label" draggable="true" data-project="${project.id}" data-idx="${idx}">
+        <span class="drag-handle" title="끌어서 순서 변경">⠿</span>
         <span>${labelHtml}</span>
         <button class="insertStageBtn" data-project="${project.id}" data-idx="${idx}" title="이 단계 다음에 새 단계 추가" style="float:right; width:18px; height:18px; line-height:16px; padding:0; border:1px solid #d1d5db; border-radius:4px; background:#fff; cursor:pointer; font-size:12px;">+</button>
       </div>
@@ -632,6 +772,8 @@ function renderOneGantt(project) {
     <div class="gantt-project" style="margin-bottom:24px;">
       <div style="display:flex; align-items:center; gap:8px; margin-bottom:6px;">
         <h3 style="font-size:14px; margin:0;">${project.name}</h3>
+        <button class="renameProjectBtn" data-project="${project.id}" title="프로젝트 이름 수정" style="padding:3px 8px; font-size:12px; border:1px solid #d1d5db; border-radius:6px; background:#fff; cursor:pointer;">✎ 이름 수정</button>
+        <button class="deleteProjectBtn" data-project="${project.id}" title="프로젝트 삭제" style="padding:3px 8px; font-size:12px; border:1px solid #dc2626; color:#dc2626; border-radius:6px; background:#fff; cursor:pointer;">삭제</button>
         <button class="addStageFrontBtn" data-project="${project.id}" style="margin-left:auto; padding:4px 10px; font-size:12px; border:1px solid #d1d5db; border-radius:6px; background:#fff; cursor:pointer;">+ 맨 앞에 추가</button>
         <button class="addStageBtn" data-project="${project.id}" style="padding:4px 10px; font-size:12px; border:1px solid #d1d5db; border-radius:6px; background:#fff; cursor:pointer;">+ 맨 뒤에 추가</button>
       </div>
@@ -650,15 +792,64 @@ function renderOneGantt(project) {
     </div>`;
 }
 
-function renderGantt() {
-  return `
-    <div style="display:flex; align-items:center; margin:8px 0;">
-      <p style="font-size:12px; color:#6b7280; margin:0;">KPI 프로젝트별 단계 일정입니다. 각 단계를 클릭해서 KPI명과 기간을 설정/수정하세요.</p>
-      <button id="addProjectBtn" style="margin-left:auto; padding:6px 12px; border:1px solid #2563eb; color:#2563eb; background:#fff; border-radius:6px; cursor:pointer;">+ 프로젝트 추가</button>
-    </div>
-    ${kpiProjects.map(renderOneGantt).join("") || `<div class="gantt-empty">등록된 프로젝트가 없습니다. "+ 프로젝트 추가"를 눌러주세요.</div>`}`;
+function projectDateRange(project) {
+  const stages = project.stages || [];
+  const starts = stages.map((s) => s.start).filter(Boolean).sort();
+  const ends = stages.map((s) => s.end).filter(Boolean).sort();
+  const namedStart = stages.find((s) => s.label === "프로젝트 착수")?.start;
+  const namedEnd = stages.find((s) => s.label === "오픈")?.end;
+  return { start: namedStart || starts[0] || "", end: namedEnd || ends[ends.length - 1] || "" };
+}
+function projectOverlapsYear(project, year) {
+  const { start, end } = projectDateRange(project);
+  if (!start && !end) return true;   // 기간이 아예 없으면 현재 연도에는 노출(설정 유도)
+  const s = start || end, e = end || start;
+  return s <= `${year}-12-31` && e >= `${year}-01-01`;
 }
 
+function renderGantt() {
+  const sortedProjects = [...kpiProjects]
+    .filter((p) => projectOverlapsYear(p, ganttYear))
+    .sort((a, b) => {
+      const sa = projectDateRange(a).start || "9999-99-99";
+      const sb = projectDateRange(b).start || "9999-99-99";
+      return sa.localeCompare(sb);
+    });
+  return `
+    <div class="year-nav">
+      <button id="prevGanttYearBtn">◀</button>
+      <strong>${ganttYear}년</strong>
+      <button id="nextGanttYearBtn">▶</button>
+    </div>
+    <div style="display:flex; align-items:center; margin:8px 0;">
+      <p style="font-size:12px; color:#6b7280; margin:0;">KPI 프로젝트별 단계 일정입니다. 프로젝트 착수~오픈 기간이 선택한 연도와 겹치는 프로젝트만 표시되며, 1단계 시작일 순으로 정렬됩니다. 각 단계를 클릭해서 KPI명과 기간을 설정/수정하세요.</p>
+      <button id="addProjectBtn" style="margin-left:auto; padding:6px 12px; border:1px solid #2563eb; color:#2563eb; background:#fff; border-radius:6px; cursor:pointer;">+ 프로젝트 추가</button>
+    </div>
+    ${sortedProjects.map((p) => renderOneGantt(p, ganttYear)).join("") || `<div class="gantt-empty">${ganttYear}년에 표시할 프로젝트가 없습니다.</div>`}`;
+}
+
+function renderNewProjectModal() {
+  return `
+    <div class="modal-backdrop" id="npBackdrop">
+      <div class="modal" style="width:560px;">
+        <h2>새 프로젝트 추가</h2>
+        <label>프로젝트명<input id="np_name" value="새 프로젝트" /></label>
+        <p style="font-size:12px; color:#6b7280; margin:8px 0 4px;">기본 단계별 일정을 지금 바로 넣거나, 비워두고 나중에 각 단계를 클릭해서 넣어도 됩니다.</p>
+        <div style="max-height:320px; overflow-y:auto; border:1px solid #e5e7eb; border-radius:6px; padding:10px;">
+          ${FIXED_GANTT_ITEMS.map((label, idx) => `
+            <div class="row" style="align-items:center; margin-bottom:8px;">
+              <span style="flex:1.4; font-size:13px;">${label}</span>
+              <label style="flex:1; font-size:11px;">시작일<input type="date" id="np_start_${idx}" /></label>
+              <label style="flex:1; font-size:11px;">종료일<input type="date" id="np_end_${idx}" /></label>
+            </div>`).join("")}
+        </div>
+        <div class="modal-actions">
+          <button id="npCancelBtn">취소</button>
+          <button class="primary" id="npSaveBtn">추가</button>
+        </div>
+      </div>
+    </div>`;
+}
 function renderKpiModal() {
   const project = kpiProjects.find((p) => p.id === kpiModal.projectId);
   const item = (project?.stages || [])[kpiModal.stageIdx] || {};
@@ -680,36 +871,65 @@ function renderKpiModal() {
     </div>`;
 }
 
-function renderList() {
-  const filtered = tasks
+function getFilteredTasks() {
+  return tasks
     .filter((t) =>
       (listFilter.status === "전체" || t.status === listFilter.status) &&
-      (!listFilter.keyword || (t.title || "").includes(listFilter.keyword))
+      (!listFilter.keyword || (t.title || "").includes(listFilter.keyword)) &&
+      (listYear === "전체" || (t.reqDate || "").slice(0, 4) === listYear)
     )
     .sort((a, b) => (b.reqDate || "").localeCompare(a.reqDate || ""));
+}
+function renderList() {
+  const years = ["전체", ...Array.from(new Set(tasks.map((t) => t.reqDate?.slice(0, 4)).filter(Boolean))).sort((a, b) => b.localeCompare(a))];
+  const filtered = getFilteredTasks();
+
+  const totalPages = Math.max(1, Math.ceil(filtered.length / LIST_PAGE_SIZE));
+  if (listPage > totalPages) listPage = totalPages;
+  const pageItems = filtered.slice((listPage - 1) * LIST_PAGE_SIZE, listPage * LIST_PAGE_SIZE);
+
   return `
-    <div class="list-toolbar">
+    <div class="list-toolbar" style="align-items:center;">
       <input id="kw" placeholder="일정명 검색" value="${listFilter.keyword}" />
-      <select id="statusFilter">
-        ${["전체", ...STATUS_VALUES].map((s) => `<option ${s === listFilter.status ? "selected" : ""}>${s}</option>`).join("")}
-      </select>
+      <label style="font-size:12px; color:#6b7280; display:flex; align-items:center; gap:4px;">완료여부
+        <select id="statusFilter">
+          ${["전체", ...STATUS_VALUES].map((s) => `<option ${s === listFilter.status ? "selected" : ""}>${s}</option>`).join("")}
+        </select>
+      </label>
+      <label style="font-size:12px; color:#6b7280; display:flex; align-items:center; gap:4px;">연도별
+        <select id="yearFilter">
+          ${years.map((y) => `<option value="${y}" ${y === listYear ? "selected" : ""}>${y === "전체" ? "전체" : y + "년"}</option>`).join("")}
+        </select>
+      </label>
+      <button id="importBtn" style="margin-left:auto;">엑셀 일괄등록</button>
+      <button id="deleteAllBtn" style="color:#dc2626; border-color:#dc2626;">조회된 일정 삭제</button>
       <button id="addBtn">+ 새 일정</button>
     </div>
     <div class="sheet-wrap">
       <table class="sheet">
-        <thead><tr><th>일정명</th><th>서비스구분</th><th>요청부서</th><th>요청일자</th><th>적용일자</th><th>완료여부</th></tr></thead>
+        <thead><tr><th>NO</th><th>일정명</th><th>서비스구분</th><th>요청부서</th><th>요청일자</th><th>적용일자</th><th>완료여부</th></tr></thead>
         <tbody>
-          ${filtered.map((t) => `
+          ${pageItems.map((t, i) => `
             <tr data-id="${t.id}" class="${isLocked(t) ? "locked" : ""}">
+              <td>${(listPage - 1) * LIST_PAGE_SIZE + i + 1}</td>
               <td style="text-align:left">${t.title}</td>
               <td>${t.service}</td>
               <td>${t.reqDept || ""}</td>
               <td>${t.reqDate || ""}</td>
               <td>${t.applyDate || ""}</td>
               <td><span class="badge" style="background:${STATUS_COLORS[t.status] || "#6b7280"}">${t.status}</span></td>
-            </tr>`).join("") || `<tr><td colspan="6">등록된 일정이 없습니다.</td></tr>`}
+            </tr>`).join("") || `<tr><td colspan="7">등록된 일정이 없습니다.</td></tr>`}
         </tbody>
       </table>
+    </div>
+    <div class="year-nav" style="margin-top:10px; justify-content:space-between;">
+      <span style="font-size:13px; color:#6b7280;">전체 ${filtered.length}건</span>
+      ${filtered.length > LIST_PAGE_SIZE ? `
+        <div style="display:flex; align-items:center; gap:12px;">
+          <button id="prevListPageBtn" ${listPage <= 1 ? "disabled" : ""}>◀</button>
+          <strong>${listPage} / ${totalPages} 페이지</strong>
+          <button id="nextListPageBtn" ${listPage >= totalPages ? "disabled" : ""}>▶</button>
+        </div>` : `<span></span>`}
     </div>`;
 }
 
@@ -718,11 +938,6 @@ function bindTabEvents() {
     document.getElementById("prevYearBtn").onclick = () => { summaryYear--; render(); };
     document.getElementById("nextYearBtn").onclick = () => { summaryYear++; render(); };
     document.getElementById("exportBtn").onclick = () => exportWeeklyReport();
-    document.getElementById("importBtn").onclick = () => document.getElementById("importFile").click();
-    document.getElementById("importFile").onchange = (e) => {
-      if (e.target.files[0]) handleImportFile(e.target.files[0]);
-      e.target.value = "";
-    };
     document.querySelectorAll(".recent-table tbody tr[data-id]").forEach((r) => r.onclick = () => openEdit(tasks.find((t) => t.id === r.dataset.id)));
   } else if (tab === "calendar") {
     document.getElementById("prevM").onclick = () => { const d = new Date(ym.year, ym.month - 1, 1); ym = { year: d.getFullYear(), month: d.getMonth() }; render(); };
@@ -733,12 +948,46 @@ function bindTabEvents() {
     }));
     document.querySelectorAll(".cal-task").forEach((b) => b.onclick = () => openEdit(tasks.find((t) => t.id === b.dataset.id)));
   } else if (tab === "gantt") {
-    document.getElementById("addProjectBtn").onclick = async () => {
-      const name = prompt("새 프로젝트 이름을 입력하세요", "새 프로젝트");
+    document.getElementById("prevGanttYearBtn").onclick = () => { ganttYear--; render(); };
+    document.getElementById("nextGanttYearBtn").onclick = () => { ganttYear++; render(); };
+    document.getElementById("addProjectBtn").onclick = () => { newProjectModal = true; render(); };
+    document.querySelectorAll(".renameProjectBtn").forEach((b) => b.onclick = async () => {
+      const project = kpiProjects.find((p) => p.id === b.dataset.project);
+      const name = prompt("프로젝트 이름을 수정하세요", project?.name || "");
       if (!name) return;
-      const stages = FIXED_GANTT_ITEMS.map((label) => ({ label, kpiName: "", start: "", end: "" }));
-      await kpiCol.add({ name, stages, createdAt: Date.now() });
-    };
+      await kpiCol.doc(b.dataset.project).update({ name });
+    });
+    document.querySelectorAll(".deleteProjectBtn").forEach((b) => b.onclick = async () => {
+      const project = kpiProjects.find((p) => p.id === b.dataset.project);
+      if (!confirm(`"${project?.name || ""}" 프로젝트를 삭제할까요? 안에 있는 단계 일정도 모두 함께 삭제됩니다.`)) return;
+      await kpiCol.doc(b.dataset.project).delete();
+    });
+    let dragState = null;
+    document.querySelectorAll(".gantt-row-label").forEach((el) => {
+      el.addEventListener("dragstart", (e) => {
+        dragState = { projectId: el.dataset.project, fromIdx: Number(el.dataset.idx) };
+        e.dataTransfer.effectAllowed = "move";
+      });
+      el.addEventListener("dragover", (e) => {
+        if (!dragState || dragState.projectId !== el.dataset.project) return;
+        e.preventDefault();
+        el.classList.add("drag-over");
+      });
+      el.addEventListener("dragleave", () => el.classList.remove("drag-over"));
+      el.addEventListener("drop", async (e) => {
+        e.preventDefault();
+        el.classList.remove("drag-over");
+        if (!dragState || dragState.projectId !== el.dataset.project) return;
+        const toIdx = Number(el.dataset.idx);
+        if (toIdx === dragState.fromIdx) { dragState = null; return; }
+        const project = kpiProjects.find((p) => p.id === dragState.projectId);
+        const stages = [...(project.stages || [])];
+        const [moved] = stages.splice(dragState.fromIdx, 1);
+        stages.splice(toIdx, 0, moved);
+        await kpiCol.doc(project.id).update({ stages });
+        dragState = null;
+      });
+    });
     document.querySelectorAll(".addStageBtn").forEach((b) => b.onclick = async () => {
       const label = prompt("새 단계 이름을 입력하세요", "새 단계");
       if (!label) return;
@@ -768,13 +1017,49 @@ function bindTabEvents() {
     }));
   } else {
     document.getElementById("addBtn").onclick = () => openNew(fmt(new Date()));
-    document.getElementById("kw").oninput = (e) => { listFilter.keyword = e.target.value; render(); };
-    document.getElementById("statusFilter").onchange = (e) => { listFilter.status = e.target.value; render(); };
+    const kwEl = document.getElementById("kw");
+    let isComposingKw = false;
+    kwEl.addEventListener("compositionstart", () => { isComposingKw = true; });
+    kwEl.addEventListener("compositionend", (e) => {
+      isComposingKw = false;
+      listFilter.keyword = e.target.value; listPage = 1; render();
+    });
+    kwEl.oninput = (e) => {
+      listFilter.keyword = e.target.value;
+      listPage = 1;
+      if (!isComposingKw) render();
+    };
+    document.getElementById("statusFilter").onchange = (e) => { listFilter.status = e.target.value; listPage = 1; render(); };
+    document.getElementById("yearFilter").onchange = (e) => { listYear = e.target.value; listPage = 1; render(); };
+    document.getElementById("importBtn").onclick = () => document.getElementById("importFile").click();
+    document.getElementById("deleteAllBtn").onclick = () => deleteAllTasks();
+    document.getElementById("importFile").onchange = (e) => {
+      if (e.target.files[0]) handleImportFile(e.target.files[0]);
+      e.target.value = "";
+    };
+    const prevPageBtn = document.getElementById("prevListPageBtn");
+    const nextPageBtn = document.getElementById("nextListPageBtn");
+    if (prevPageBtn) prevPageBtn.onclick = () => { listPage--; render(); };
+    if (nextPageBtn) nextPageBtn.onclick = () => { listPage++; render(); };
     document.querySelectorAll(".sheet tbody tr[data-id]").forEach((r) => r.onclick = () => openEdit(tasks.find((t) => t.id === r.dataset.id)));
   }
 }
 
 /* ===== 간트차트 전용 팝업 ===== */
+function bindNewProjectModalEvents() {
+  document.getElementById("npBackdrop").addEventListener("click", (e) => { if (e.target.id === "npBackdrop") { newProjectModal = false; render(); } });
+  document.getElementById("npCancelBtn").onclick = () => { newProjectModal = false; render(); };
+  document.getElementById("npSaveBtn").onclick = async () => {
+    const name = document.getElementById("np_name").value.trim() || "새 프로젝트";
+    const stages = FIXED_GANTT_ITEMS.map((label, idx) => ({
+      label, kpiName: "",
+      start: document.getElementById(`np_start_${idx}`).value,
+      end: document.getElementById(`np_end_${idx}`).value,
+    }));
+    await kpiCol.add({ name, stages, createdAt: Date.now() });
+    newProjectModal = false; render();
+  };
+}
 function openKpiModal(projectId, stageIdx) { kpiModal = { projectId, stageIdx }; render(); }
 function closeKpiModal() { kpiModal = null; render(); }
 function bindKpiModalEvents() {
@@ -824,7 +1109,7 @@ async function openEdit(task) {
   render();
 }
 function closeModal() {
-  if (modal?.task) releaseLock(modal.task.id);
+  if (modal?.task && !modal.lockedBy) releaseLock(modal.task.id);
   modal = null; render();
 }
 
@@ -882,7 +1167,7 @@ function renderModal() {
           </div>
           <div class="row">
             <label>협의일자<input type="date" id="f_meetingDate" value="${t.meetingDate || ""}" /></label>
-            <label>적용일자(완료예정일)<input type="date" id="f_applyDate" value="${t.applyDate || ""}" /></label>
+            <label>적용일자<input type="date" id="f_applyDate" value="${t.applyDate || ""}" /></label>
             <label>완료여부<select id="f_status">${STATUS_VALUES.map((v) => `<option ${v === (t.status || "진행") ? "selected" : ""}>${v}</option>`).join("")}</select></label>
           </div>
 
@@ -890,7 +1175,7 @@ function renderModal() {
         </fieldset>
         <p class="warning" id="dateWarning" style="display:none;">적용일자가 요청일자보다 이전일 수 없습니다.</p>
         <div class="modal-actions">
-          ${modal.task ? `<button class="danger" id="deleteBtn">삭제</button>` : ""}
+          ${modal.task ? `<button class="danger" id="deleteBtn" ${locked ? "disabled" : ""}>삭제</button>` : ""}
           <button id="cancelBtn">취소</button>
           <button class="primary" id="saveBtn" ${locked ? "disabled" : ""}>저장</button>
         </div>
@@ -922,7 +1207,7 @@ function bindModalEvents() {
 
   if (modal.task) {
     document.getElementById("deleteBtn").onclick = async () => {
-      if (confirm("이 일정을 삭제할까요?")) { await tasksCol.doc(modal.task.id).delete(); modal = null; render(); }
+      if (confirm("이 일정을 삭제할까요?")) { stopLockHeartbeat(); await tasksCol.doc(modal.task.id).delete(); modal = null; render(); }
     };
   }
 
@@ -958,6 +1243,7 @@ function bindModalEvents() {
       memo: document.getElementById("f_memo").value,
     };
     if (modal.task) {
+      stopLockHeartbeat();
       data.editingBy = firebase.firestore.FieldValue.delete();
       data.editingAt = firebase.firestore.FieldValue.delete();
       await tasksCol.doc(modal.task.id).update(data);
@@ -969,6 +1255,23 @@ function bindModalEvents() {
 }
 
 render();
+
+/* ===== 스크롤 위치 저장/복원 (새로고침해도 보던 위치 유지) ===== */
+window.addEventListener("beforeunload", () => {
+  sessionStorage.setItem("scheduler_scroll", String(window.scrollY));
+});
+window.addEventListener("scroll", () => {
+  sessionStorage.setItem("scheduler_scroll", String(window.scrollY));
+}, { passive: true });
+let scrollRestored = false;
+function maybeRestoreScroll() {
+  if (scrollRestored) return;
+  const y = Number(sessionStorage.getItem("scheduler_scroll") || 0);
+  if (y > 0) {
+    scrollRestored = true;
+    requestAnimationFrame(() => requestAnimationFrame(() => window.scrollTo(0, y)));
+  }
+}
 </script>
 </body>
 </html>
