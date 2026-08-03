@@ -151,8 +151,8 @@ const SERVICE_TYPES = ["UBMS", "SEM", "SMP", "HOME", "승인계", "BAT", "직접
 const DEV_DEPTS = ["정보개발실", "승인개발실", "직접입력"];
 const MEETING_VALUES = ["없음", "완료"];   // 요청협의/개발협의/업무설계/화면설계 공통
 const CF_VALUES = ["N", "Y"];
-const STATUS_VALUES = ["진행", "지연", "완료"];
-const STATUS_COLORS = { "진행": "#2563eb", "지연": "#dc2626", "완료": "#16a34a" };
+const STATUS_VALUES = ["진행", "완료", "대기중"];
+const STATUS_COLORS = { "진행": "#2563eb", "지연": "#dc2626", "완료": "#16a34a", "대기중": "#6b7280" };
 const LOCK_TTL_MS = 60000;
 
 function fmt(d) {
@@ -206,6 +206,7 @@ let tasks = [];
 let tab = localStorage.getItem("scheduler_tab") || "dashboard";
 let now = new Date();
 let ym = { year: now.getFullYear(), month: now.getMonth() };
+let calendarBasis = "req";   // 달력 조회 기준: "req"=요청일자, "apply"=적용일자
 let summaryYear = now.getFullYear();   // 대시보드 월별 집계표에서 조회 중인 연도
 let ganttYear = now.getFullYear();     // 장기 프로젝트 관리 탭에서 조회 중인 연도
 let modal = null;
@@ -215,6 +216,7 @@ let newProjectModal = false;   // 새 프로젝트 추가 팝업 (프로젝트�
 let listFilter = { status: "전체", keyword: "" };
 let listYear = "전체";
 let listPage = 1;
+let selectedTaskIds = new Set();
 const LIST_PAGE_SIZE = 50;
 
 /* ===== Firestore 실시간 구독 ===== */
@@ -292,7 +294,7 @@ function computeDashboard() {
 
 /* ===== 엑셀 다운로드 (서식 포함) ===== */
 async function exportWeeklyReport() {
-  const { thisMonth, monthly } = computeDashboard();
+  const { monthly } = computeDashboard();
   const wb = new ExcelJS.Workbook();
   const HEADER_FILL = { type: "pattern", pattern: "solid", fgColor: { argb: "FFDAF2D0" } };
   const THIN = { style: "thin", color: { argb: "FFB0B0B0" } };
@@ -306,7 +308,8 @@ async function exportWeeklyReport() {
       cell.border = BORDER;
       const m = Array.isArray(mode) ? mode[colNumber - 1] : mode;
       if (m === "title") { cell.font = { bold: true }; cell.fill = HEADER_FILL; cell.alignment = CENTER; }
-      else if (m === "label") { cell.font = { bold: true }; cell.fill = HEADER_FILL; }
+      else if (m === "label") { cell.font = { bold: true }; cell.fill = HEADER_FILL; cell.alignment = CENTER; }
+      else if (m === "center") { cell.alignment = CENTER; }
     });
     return row;
   }
@@ -334,35 +337,191 @@ async function exportWeeklyReport() {
   }
 
   const sSheet = wb.addWorksheet("요약");
-  addRow(sSheet, ["이번 달 현황", `${thisMonth.month.slice(0, 4)}년 ${Number(thisMonth.month.slice(5, 7))}월`], "title");
-  addRow(sSheet, ["개발요청건", thisMonth.requested], ["title", "plain"]);
-  addRow(sSheet, ["진행중", thisMonth.delayed ? `${thisMonth.inProgress} (지연 ${thisMonth.delayed})` : thisMonth.inProgress], ["title", "plain"]);
-  addRow(sSheet, ["완료건", thisMonth.done], ["title", "plain"]);
-  addRow(sSheet, ["완료율", `${thisMonth.doneRate}%`], ["title", "plain"]);
-  addRow(sSheet, ["진행률", `${thisMonth.progressRate}%`], ["title", "plain"]);
+
+  // 최근 3개월 현황
+  function lastNMonthKeys(n) {
+    const arr = [];
+    const now = new Date();
+    for (let i = 0; i < n; i++) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);   // day=1로 고정해서 월말 overflow로 인한 중복 방지
+      arr.unshift(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`);
+    }
+    return arr;
+  }
+  const monthlyMap = Object.fromEntries(monthly.map((m) => [m.month, m]));
+  addTitleRow(sSheet, "최근 3개월 현황", 5);
+  addRow(sSheet, ["월", "개발요청건", "진행중", "완료건", "완료율"], "title");
+  lastNMonthKeys(3).forEach((key) => {
+    const m = monthlyMap[key] || { requested: 0, inProgress: 0, done: 0, doneRate: 0 };
+    addRow(sSheet, [`${key.slice(0, 4)}년 ${Number(key.slice(5, 7))}월`, m.requested, m.inProgress, m.done, `${m.doneRate}%`], "center");
+  });
   sSheet.addRow([]);
 
-  let lastYear = "";
-  monthly.forEach((m) => {
-    const year = m.month.slice(0, 4);
-    if (year !== lastYear) {
-      addTitleRow(sSheet, `${year}년 월별 집계`, 7);
-      addRow(sSheet, ["월", "개발요청건", "진행중", "지연", "완료건", "완료율", "진행률"], "title");
-      lastYear = year;
-    }
-    addRow(sSheet, [
-      `${Number(m.month.slice(5, 7))}월`, m.requested, m.inProgress, m.delayed, m.done,
-      `${m.doneRate}%`, `${m.progressRate}%`,
-    ], "plain");
+  // 연도별 월별 집계 (대시보드와 동일하게 연도별 합계 행 포함)
+  const monthlyByYear = {};
+  monthly.forEach((m) => { (monthlyByYear[m.month.slice(0, 4)] ??= []).push(m); });
+  Object.keys(monthlyByYear).sort((a, b) => a.localeCompare(b)).forEach((year) => {
+    const months = monthlyByYear[year];
+    addTitleRow(sSheet, `${year}년 월별 집계`, 5);
+    addRow(sSheet, ["월", "개발요청건", "진행중", "완료건", "완료율"], "title");
+    months.forEach((m) => {
+      addRow(sSheet, [`${Number(m.month.slice(5, 7))}월`, m.requested, m.inProgress, m.done, `${m.doneRate}%`], "center");
+    });
+    const tReq = months.reduce((s, m) => s + m.requested, 0);
+    const tProg = months.reduce((s, m) => s + m.inProgress, 0);
+    const tDone = months.reduce((s, m) => s + m.done, 0);
+    const tRate = tReq ? Math.round((tDone / tReq) * 100) : 0;
+    addRow(sSheet, ["합계", tReq, tProg, tDone, `${tRate}%`], "label");
+    sSheet.addRow([]);
   });
   autoFitColumns(sSheet);
 
-  const lSheet = wb.addWorksheet("일정목록");
-  addRow(lSheet, ["일정명", "요청부서", "요청자", "요청일자", "서비스구분", "서비스명", "개발부서", "완료여부", "적용일자"], "title");
-  tasks.forEach((t) => {
-    addRow(lSheet, [t.title, t.reqDept, t.requester, t.reqDate, t.service, t.serviceName, t.devDept, t.status, t.applyDate], "plain");
+  // 주간보고 시트: 요약 시트의 '최근 3개월 현황'과 같은 형식이되, 관련 문서번호가 'KPI'인 건은 집계에서 제외
+  const wSheet = wb.addWorksheet("주간보고");
+  const nonKpiTasks = tasks.filter((t) => (t.docNo || "").trim() !== "KPI");
+  function computeMonthlyFrom(list) {
+    const byMonth = {};
+    list.forEach((t) => {
+      const key = t.reqDate ? t.reqDate.slice(0, 7) : null;
+      if (!key) return;
+      const m = (byMonth[key] ??= { requested: 0, inProgress: 0, done: 0 });
+      m.requested++;
+      if (t.status === "완료") m.done++; else m.inProgress++;
+    });
+    return byMonth;
+  }
+  const nonKpiByMonth = computeMonthlyFrom(nonKpiTasks);
+  addTitleRow(wSheet, "최근 3개월 현황 (KPI 제외)", 5);
+  addRow(wSheet, ["월", "개발요청건", "진행중", "완료건", "완료율"], "title");
+  const last3Keys = lastNMonthKeys(3);
+  last3Keys.forEach((key) => {
+    const m = nonKpiByMonth[key] || { requested: 0, inProgress: 0, done: 0 };
+    const rate = m.requested ? Math.round((m.done / m.requested) * 100) : 0;
+    addRow(wSheet, [`${key.slice(0, 4)}년 ${Number(key.slice(5, 7))}월`, m.requested, m.inProgress, m.done, `${rate}%`], "center");
   });
-  autoFitColumns(lSheet);
+
+  // 최근 3개월 일정목록 (현황 표와 1행 띄우고 표시) - 그룹 헤더 3개 + 완료여부만, 지정된 항목만 포함, KPI 제외
+  wSheet.addRow([]);
+  const RECENT_GROUPS = [
+    { label: "기획부서 협의", span: 5, fill: "FFDAF2D0" },
+    { label: "개발부서 협의", span: 2, fill: "FFD6E4FF" },
+    { label: "개발일정", span: 3, fill: "FFE6D9F7" },
+    { label: "완료여부", span: 1, fill: "FFFDE4CF" },
+  ];
+  const RECENT_SUBHEADERS = ["NO", "요청월", "요청일자", "요청사항", "관련 문서번호", "서비스 구분", "개발부서", "CF요청일자", "협의일자", "적용일자"];
+  const groupRow = wSheet.addRow([]);
+  groupRow.height = 30;
+  let gcol = 1;
+  RECENT_GROUPS.forEach((g) => {
+    const fill = { type: "pattern", pattern: "solid", fgColor: { argb: g.fill } };
+    if (g.span > 1) wSheet.mergeCells(groupRow.number, gcol, groupRow.number, gcol + g.span - 1);
+    else wSheet.mergeCells(groupRow.number, gcol, groupRow.number + 1, gcol);
+    for (let c = gcol; c < gcol + g.span; c++) {
+      const cell = groupRow.getCell(c);
+      if (c === gcol) cell.value = g.label;
+      cell.border = BORDER; cell.font = { bold: true }; cell.fill = fill; cell.alignment = CENTER;
+    }
+    gcol += g.span;
+  });
+  const subRow = wSheet.getRow(groupRow.number + 1);
+  RECENT_SUBHEADERS.forEach((v, idx) => { subRow.getCell(idx + 1).value = v; });
+  subRow.eachCell({ includeEmpty: false }, (cell, colNumber) => {
+    const g = colNumber <= 5 ? RECENT_GROUPS[0] : colNumber <= 7 ? RECENT_GROUPS[1] : RECENT_GROUPS[2];
+    cell.border = BORDER; cell.font = { bold: true }; cell.alignment = CENTER;
+    cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: g.fill } };
+  });
+  subRow.getCell(11).border = BORDER;
+
+  const last3Set = new Set(last3Keys);
+  const recentList = nonKpiTasks
+    .filter((t) => t.reqDate && last3Set.has(t.reqDate.slice(0, 7)))
+    .sort((a, b) => (a.reqDate || "").localeCompare(b.reqDate || ""));
+  recentList.forEach((t, i) => {
+    const row = addRow(wSheet, [
+      i + 1, t.reqDate ? `${Number(t.reqDate.slice(5, 7))}월` : "", t.reqDate || "", t.reqContent || "", t.docNo || "",
+      t.service || "", t.devDept || "",
+      t.cfDate || "", t.meetingDate || "", t.applyDate || "",
+      t.status || "",
+    ], "plain");
+    row.eachCell({ includeEmpty: false }, (cell, colNumber) => {
+      if (colNumber !== 4) cell.alignment = CENTER;   // 요청사항(4) 제외하고 가운데 정렬
+    });
+  });
+  autoFitColumns(wSheet);
+
+  // 일정목록: 기존 사내 양식과 동일한 구조로, 요청일자 연도별 시트 분리 + 요청일자 오름차순 정렬
+  // (실제 이미지 픽셀 분석 결과: 1행=그룹 제목(굵고 큰 행), 2행=세부 항목명(그룹 색 유지), 빈 줄 없이 3행부터 바로 데이터)
+  const LIST_GROUPS = [
+    { label: "기획부서 협의", span: 8, fill: "FFDAF2D0" },
+    { label: "개발부서 협의", span: 7, fill: "FFD6E4FF" },
+    { label: "개발일정", span: 5, fill: "FFE6D9F7" },
+    { label: "완료여부", span: 1, fill: "FFFDE4CF" },
+    { label: "메모", span: 1, fill: "FFFBD1E3" },
+  ];
+  const LIST_SUBHEADERS = [
+    "NO", "요청월", "요청일자", "요청부서", "요청자", "요청협의", "요청사항", "관련 문서번호",
+    "서비스 코드", "서비스 구분", "서비스 명", "개발부서", "개발협의", "업무설계", "화면설계",
+    "CF요청", "CF번호", "CF요청일자", "협의일자", "적용일자",
+  ];
+  function addListSheet(name, list) {
+    const sheet = wb.addWorksheet(name.slice(0, 31));
+    const row1 = sheet.addRow([]);
+    row1.height = 30;
+    let col = 1;
+    LIST_GROUPS.forEach((g) => {
+      const fill = { type: "pattern", pattern: "solid", fgColor: { argb: g.fill } };
+      if (g.span > 1) sheet.mergeCells(row1.number, col, row1.number, col + g.span - 1);
+      else sheet.mergeCells(row1.number, col, row1.number + 1, col);   // 완료여부/메모: row1~row2 세로 병합
+      for (let c = col; c < col + g.span; c++) {
+        const cell = row1.getCell(c);
+        if (c === col) cell.value = g.label;
+        cell.border = BORDER; cell.font = { bold: true }; cell.fill = fill; cell.alignment = CENTER;
+      }
+      col += g.span;
+    });
+    const row2 = sheet.getRow(2);   // 세부 항목명 행 (그룹 색 유지, 빈 줄 없음) - addRow 대신 getRow로 정확히 2행 지정
+    LIST_SUBHEADERS.forEach((v, idx) => { row2.getCell(idx + 1).value = v; });
+    row2.eachCell({ includeEmpty: false }, (cell, colNumber) => {
+      const g = colNumber <= 8 ? LIST_GROUPS[0] : colNumber <= 15 ? LIST_GROUPS[1] : LIST_GROUPS[2];
+      cell.border = BORDER; cell.font = { bold: true }; cell.alignment = CENTER;
+      cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: g.fill } };
+    });
+    [21, 22].forEach((c) => { row2.getCell(c).border = BORDER; });
+
+    list.forEach((t, i) => {
+      const row = addRow(sheet, [
+        i + 1, t.reqDate ? `${Number(t.reqDate.slice(5, 7))}월` : "", t.reqDate || "", t.reqDept || "", t.requester || "",
+        t.reqMeeting || "", t.reqContent || "", t.docNo || "",
+        t.serviceCode || "", t.service || "", t.serviceName || "", t.devDept || "", t.devMeeting || "", t.workDesign || "", t.screenDesign || "",
+        t.cfRequest || "", t.cfNo || "", t.cfDate || "", t.meetingDate || "", t.applyDate || "",
+        t.status || "", t.memo || "",
+      ], "plain");
+      row.eachCell({ includeEmpty: false }, (cell, colNumber) => {
+        if (colNumber !== 7 && colNumber !== 11 && colNumber !== 22) cell.alignment = CENTER;   // 요청사항(7), 서비스명(11), 메모(22) 제외
+      });
+    });
+    autoFitColumns(sheet);
+  }
+
+  const byYear = {};
+  tasks.forEach((t) => {
+    if (t.status === "대기중") return;   // 대기중 건은 별도 시트에서 관리
+    const y = t.reqDate ? t.reqDate.slice(0, 4) : "연도미상";
+    (byYear[y] ??= []).push(t);
+  });
+  const years = Object.keys(byYear).sort((a, b) => b.localeCompare(a));
+  const pendingTasks = tasks.filter((t) => t.status === "대기중").sort((a, b) => (a.reqDate || "").localeCompare(b.reqDate || ""));
+  const currentYearStr = String(new Date().getFullYear());
+  let pendingSheetAdded = false;
+  years.forEach((y) => {
+    const list = byYear[y].sort((a, b) => (a.reqDate || "").localeCompare(b.reqDate || ""));
+    addListSheet(`${y}년 일정목록`, list);
+    if (y === currentYearStr) {
+      addListSheet("대기중", pendingTasks);
+      pendingSheetAdded = true;
+    }
+  });
+  if (!pendingSheetAdded) addListSheet("대기중", pendingTasks);   // 당해년도 시트가 없으면 맨 뒤에 추가
 
   const buf = await wb.xlsx.writeBuffer();
   const blob = new Blob([buf], { type: "application/octet-stream" });
@@ -447,19 +606,17 @@ function extractRecordsFromSheet(sheet) {
     return rec;
   }).filter(Boolean);
 }
-async function deleteAllTasks() {
-  const targets = getFilteredTasks();
-  if (targets.length === 0) { alert("삭제할 일정이 없습니다."); return; }
-  const scopeDesc = (listFilter.status === "전체" && !listFilter.keyword && listYear === "전체")
-    ? "전체"
-    : `현재 조회 조건(${listYear === "전체" ? "전체 연도" : listYear + "년"} / ${listFilter.status}${listFilter.keyword ? ` / "${listFilter.keyword}" 검색` : ""})에 해당하는`;
-  if (!confirm(`${scopeDesc} 일정 ${targets.length}건을 전부 삭제할까요?\n이 작업은 되돌릴 수 없습니다.`)) return;
+async function deleteSelectedTasks() {
+  const targets = tasks.filter((t) => selectedTaskIds.has(t.id));
+  if (targets.length === 0) { alert("삭제할 일정을 선택해주세요."); return; }
+  if (!confirm(`선택한 일정 ${targets.length}건을 삭제할까요?\n이 작업은 되돌릴 수 없습니다.`)) return;
   const CHUNK = 400;
   for (let i = 0; i < targets.length; i += CHUNK) {
     const batch = db.batch();
     targets.slice(i, i + CHUNK).forEach((t) => batch.delete(tasksCol.doc(t.id)));
     await batch.commit();
   }
+  selectedTaskIds.clear();
   alert(`${targets.length}건을 삭제했습니다.`);
 }
 async function handleImportFile(file) {
@@ -490,7 +647,14 @@ async function handleImportFile(file) {
 }
 
 /* ===== 렌더링 ===== */
+/* ===== IME(한글 등) 조합 중 재렌더링으로 입력이 끊기는 문제 방지 =====
+   document에 한 번만 붙여서, #root 내부가 통째로 교체돼도 계속 유지되도록 함 */
+let globalIsComposing = false;
+document.addEventListener("compositionstart", () => { globalIsComposing = true; });
+document.addEventListener("compositionend", () => { globalIsComposing = false; });
+
 function render() {
+  if (globalIsComposing) return;   // 조합 중에는 DOM을 건드리지 않음 (조합 끝나면 위 리스너가 다시 render 호출)
   const activeEl = document.activeElement;
   const focusInfo = (activeEl && activeEl.id && document.getElementById("root")?.contains(activeEl))
     ? { id: activeEl.id, start: activeEl.selectionStart, end: activeEl.selectionEnd }
@@ -513,7 +677,7 @@ function render() {
       <div class="sidebar-logo">프로젝트 일정관리</div>
       <nav class="sidebar-nav">
         <button data-tab="dashboard" class="${tab === "dashboard" ? "active" : ""}">대시보드</button>
-        <button data-tab="list" class="${tab === "list" ? "active" : ""}">목록</button>
+        <button data-tab="list" class="${tab === "list" ? "active" : ""}">일정 목록</button>
         <button data-tab="gantt" class="${tab === "gantt" ? "active" : ""}">장기 프로젝트 관리</button>
         <button data-tab="calendar" class="${tab === "calendar" ? "active" : ""}">달력</button>
       </nav>
@@ -521,7 +685,7 @@ function render() {
     <main class="main-content">
       <header class="main-header">
         <div>
-          <h1>${tab === "dashboard" ? "대시보드" : tab === "calendar" ? "달력" : tab === "gantt" ? "장기 프로젝트 관리" : "목록"}</h1>
+          <h1>${tab === "dashboard" ? "대시보드" : tab === "calendar" ? "달력" : tab === "gantt" ? "장기 프로젝트 관리" : "일정 목록"}</h1>
           <p class="main-sub">${fmt(new Date())} 기준</p>
         </div>
         <div style="display:flex; align-items:center; gap:12px;">
@@ -586,14 +750,12 @@ function renderDashboard() {
   const monthlyForYear = monthly.filter((m) => m.month.slice(0, 4) === String(summaryYear));
 
   const doneCount = tasks.filter((t) => t.status === "완료").length;
-  const delayedCount = tasks.filter((t) => t.status === "지연").length;
   const progressCount = tasks.filter((t) => t.status === "진행").length;
   const total = tasks.length;
   const donePct = total ? Math.round((doneCount / total) * 100) : 0;
   const doneDeg = total ? (doneCount / total) * 360 : 0;
-  const delayedDeg = total ? (delayedCount / total) * 360 : 0;
   const gradient = total
-    ? `conic-gradient(#16a34a 0deg ${doneDeg}deg, #dc2626 ${doneDeg}deg ${doneDeg + delayedDeg}deg, #2563eb ${doneDeg + delayedDeg}deg 360deg)`
+    ? `conic-gradient(#16a34a 0deg ${doneDeg}deg, #2563eb ${doneDeg}deg 360deg)`
     : "#e5e7eb";
 
   const recent = [...tasks].sort((a, b) => (b.reqDate || "").localeCompare(a.reqDate || "")).slice(0, 8);
@@ -607,7 +769,6 @@ function renderDashboard() {
       ${statCard("진행중", thisMonth.inProgress + "건", thisMonth.delayed > 0, `지연 ${thisMonth.delayed}건 포함`)}
       ${statCard("완료건", thisMonth.done + "건", false, `완료율 ${thisMonth.doneRate}%`)}
       ${statCard("완료율", thisMonth.doneRate + "%")}
-      ${statCard("진행률", thisMonth.progressRate + "%")}
     </div>
     <div class="dash-row">
       <div class="card">
@@ -617,14 +778,13 @@ function renderDashboard() {
           <button id="nextYearBtn">▶</button>
         </div>
         <table class="month-table">
-          <thead><tr><th>월</th><th>개발요청건</th><th>진행중</th><th>지연</th><th>완료건</th><th>완료율</th><th>진행률</th></tr></thead>
+          <thead><tr><th>월</th><th>개발요청건</th><th>진행중</th><th>완료건</th><th>완료율</th></tr></thead>
           <tbody>
             ${monthlyForYear.map((m) => `
               <tr>
                 <td>${Number(m.month.slice(5,7))}월</td>
                 <td>${m.requested}</td>
                 <td style="color:#2563eb;">${m.inProgress}</td>
-                <td style="color:${m.delayed > 0 ? "#dc2626" : "inherit"};">${m.delayed}</td>
                 <td>${m.done}</td>
                 <td style="text-align:left;">
                   <div class="rate-cell">
@@ -632,21 +792,17 @@ function renderDashboard() {
                     <span class="rate-text">${m.doneRate}%</span>
                   </div>
                 </td>
-                <td>${m.progressRate}%</td>
-              </tr>`).join("") || `<tr><td colspan="7">${summaryYear}년 데이터가 없습니다.</td></tr>`}
+              </tr>`).join("") || `<tr><td colspan="5">${summaryYear}년 데이터가 없습니다.</td></tr>`}
             ${monthlyForYear.length > 0 ? (() => {
               const tReq = monthlyForYear.reduce((s, m) => s + m.requested, 0);
               const tProg = monthlyForYear.reduce((s, m) => s + m.inProgress, 0);
-              const tDelay = monthlyForYear.reduce((s, m) => s + m.delayed, 0);
               const tDone = monthlyForYear.reduce((s, m) => s + m.done, 0);
               const tDoneRate = tReq ? Math.round((tDone / tReq) * 100) : 0;
-              const tProgRate = tReq ? Math.round((tProg / tReq) * 100) : 0;
               return `
               <tr style="font-weight:600; background:#f3f4f6;">
                 <td>합계</td>
                 <td>${tReq}</td>
                 <td style="color:#2563eb;">${tProg}</td>
-                <td style="color:${tDelay > 0 ? "#dc2626" : "inherit"};">${tDelay}</td>
                 <td>${tDone}</td>
                 <td style="text-align:left;">
                   <div class="rate-cell">
@@ -654,7 +810,6 @@ function renderDashboard() {
                     <span class="rate-text">${tDoneRate}%</span>
                   </div>
                 </td>
-                <td>${tProgRate}%</td>
               </tr>`;
             })() : ""}
           </tbody>
@@ -669,7 +824,6 @@ function renderDashboard() {
           <div class="donut-legend">
             <div><span class="dot" style="background:#16a34a;"></span>완료 ${doneCount}건</div>
             <div><span class="dot" style="background:#2563eb;"></span>진행 ${progressCount}건</div>
-            <div><span class="dot" style="background:#dc2626;"></span>지연 ${delayedCount}건</div>
           </div>
         </div>
       </div>
@@ -693,12 +847,11 @@ function renderDashboard() {
 function renderCalendar() {
   const grid = getMonthGrid(ym.year, ym.month);
   const dows = ["일","월","화","수","목","금","토"];
+  const dateField = calendarBasis === "apply" ? "applyDate" : "reqDate";
   const byDate = {};
   tasks.forEach((t) => {
-    const isDone = String(t.status || "").trim() === "완료";
-    const sameDayDone = isDone && t.applyDate && t.applyDate === t.reqDate;
-    if (t.reqDate && !sameDayDone) (byDate[t.reqDate] ??= []).push({ task: t, color: STATUS_COLORS[t.status] || "#6b7280", tag: "" });
-    if (isDone && t.applyDate) (byDate[t.applyDate] ??= []).push({ task: t, color: STATUS_COLORS["완료"], tag: "[완료] " });
+    const d = t[dateField];
+    if (d) (byDate[d] ??= []).push(t);
   });
   return `
     <header class="cal-header">
@@ -706,14 +859,26 @@ function renderCalendar() {
       <strong>${ym.year}년 ${ym.month + 1}월</strong>
       <button id="nextM">▶</button>
     </header>
-    <p style="font-size:12px; color:#6b7280; margin:4px 0;">파란색/빨간색/초록색: 요청일자 기준 (진행/지연/완료) &nbsp;·&nbsp; [완료] 초록색: 완료 건의 적용일자</p>
+    <div style="display:flex; justify-content:center; align-items:center; gap:14px; margin:6px 0;">
+      <label style="font-size:12px; color:#6b7280; display:flex; align-items:center; gap:6px;">조회 기준
+        <select id="calBasisFilter">
+          <option value="req" ${calendarBasis === "req" ? "selected" : ""}>요청일자 기준</option>
+          <option value="apply" ${calendarBasis === "apply" ? "selected" : ""}>적용일자 기준</option>
+        </select>
+      </label>
+      <span style="font-size:12px; color:#6b7280;">
+        <span style="display:inline-block; width:9px; height:9px; border-radius:2px; background:#2563eb; margin-right:4px;"></span>진행중인 일정
+        &nbsp;&nbsp;
+        <span style="display:inline-block; width:9px; height:9px; border-radius:2px; background:#16a34a; margin-right:4px;"></span>완료된 일정
+      </span>
+    </div>
     <div class="cal-grid">
       ${dows.map((d) => `<div class="cal-dow">${d}</div>`).join("")}
       ${grid.map((c) => `
         <div class="cal-cell ${c.inMonth ? "" : "dim"}" data-date="${c.date}">
           <div class="cal-day">${c.day}</div>
-          ${(byDate[c.date] || []).map(({ task: t, color, tag }) => `
-            <button class="cal-task ${isLocked(t) ? "locked" : ""}" data-id="${t.id}" style="background:${color}">${tag}${t.title}</button>
+          ${(byDate[c.date] || []).map((t) => `
+            <button class="cal-task ${isLocked(t) ? "locked" : ""}" data-id="${t.id}" style="background:${STATUS_COLORS[t.status] || "#6b7280"}">${t.title}</button>
           `).join("")}
         </div>`).join("")}
     </div>`;
@@ -774,8 +939,6 @@ function renderOneGantt(project, year) {
         <h3 style="font-size:14px; margin:0;">${project.name}</h3>
         <button class="renameProjectBtn" data-project="${project.id}" title="프로젝트 이름 수정" style="padding:3px 8px; font-size:12px; border:1px solid #d1d5db; border-radius:6px; background:#fff; cursor:pointer;">✎ 이름 수정</button>
         <button class="deleteProjectBtn" data-project="${project.id}" title="프로젝트 삭제" style="padding:3px 8px; font-size:12px; border:1px solid #dc2626; color:#dc2626; border-radius:6px; background:#fff; cursor:pointer;">삭제</button>
-        <button class="addStageFrontBtn" data-project="${project.id}" style="margin-left:auto; padding:4px 10px; font-size:12px; border:1px solid #d1d5db; border-radius:6px; background:#fff; cursor:pointer;">+ 맨 앞에 추가</button>
-        <button class="addStageBtn" data-project="${project.id}" style="padding:4px 10px; font-size:12px; border:1px solid #d1d5db; border-radius:6px; background:#fff; cursor:pointer;">+ 맨 뒤에 추가</button>
       </div>
       <div class="gantt-wrap">
         <div class="gantt-table" style="grid-template-rows: 20px 24px repeat(${stages.length}, 34px);">
@@ -838,7 +1001,7 @@ function renderNewProjectModal() {
         <div style="max-height:320px; overflow-y:auto; border:1px solid #e5e7eb; border-radius:6px; padding:10px;">
           ${FIXED_GANTT_ITEMS.map((label, idx) => `
             <div class="row" style="align-items:center; margin-bottom:8px;">
-              <span style="flex:1.4; font-size:13px;">${label}</span>
+              <input id="np_label_${idx}" value="${label}" style="flex:1.4; font-size:13px;" />
               <label style="flex:1; font-size:11px;">시작일<input type="date" id="np_start_${idx}" /></label>
               <label style="flex:1; font-size:11px;">종료일<input type="date" id="np_end_${idx}" /></label>
             </div>`).join("")}
@@ -882,12 +1045,6 @@ function getFilteredTasks() {
 }
 function renderList() {
   const years = ["전체", ...Array.from(new Set(tasks.map((t) => t.reqDate?.slice(0, 4)).filter(Boolean))).sort((a, b) => b.localeCompare(a))];
-  const filtered = getFilteredTasks();
-
-  const totalPages = Math.max(1, Math.ceil(filtered.length / LIST_PAGE_SIZE));
-  if (listPage > totalPages) listPage = totalPages;
-  const pageItems = filtered.slice((listPage - 1) * LIST_PAGE_SIZE, listPage * LIST_PAGE_SIZE);
-
   return `
     <div class="list-toolbar" style="align-items:center;">
       <input id="kw" placeholder="일정명 검색" value="${listFilter.keyword}" />
@@ -902,28 +1059,44 @@ function renderList() {
         </select>
       </label>
       <button id="importBtn" style="margin-left:auto;">엑셀 일괄등록</button>
-      <button id="deleteAllBtn" style="color:#dc2626; border-color:#dc2626;">조회된 일정 삭제</button>
+      <button id="deleteAllBtn" style="color:#dc2626; border-color:#dc2626;">삭제</button>
       <button id="addBtn">+ 새 일정</button>
     </div>
+    <div id="listResultsWrap">${renderListResults()}</div>`;
+}
+
+function renderListResults() {
+  const filtered = getFilteredTasks();
+  const totalPages = Math.max(1, Math.ceil(filtered.length / LIST_PAGE_SIZE));
+  if (listPage > totalPages) listPage = totalPages;
+  const pageItems = filtered.slice((listPage - 1) * LIST_PAGE_SIZE, listPage * LIST_PAGE_SIZE);
+  const allPageSelected = pageItems.length > 0 && pageItems.every((t) => selectedTaskIds.has(t.id));
+
+  return `
     <div class="sheet-wrap">
       <table class="sheet">
-        <thead><tr><th>NO</th><th>일정명</th><th>서비스구분</th><th>요청부서</th><th>요청일자</th><th>적용일자</th><th>완료여부</th></tr></thead>
+        <thead><tr>
+          <th><input type="checkbox" id="selectAllChk" ${allPageSelected ? "checked" : ""} /></th>
+          <th>NO</th><th>일정명</th><th>관련 문서번호</th><th>서비스구분</th><th>요청부서</th><th>요청일자</th><th>적용일자</th><th>완료여부</th>
+        </tr></thead>
         <tbody>
           ${pageItems.map((t, i) => `
             <tr data-id="${t.id}" class="${isLocked(t) ? "locked" : ""}">
+              <td><input type="checkbox" class="rowChk" data-id="${t.id}" ${selectedTaskIds.has(t.id) ? "checked" : ""} /></td>
               <td>${(listPage - 1) * LIST_PAGE_SIZE + i + 1}</td>
               <td style="text-align:left">${t.title}</td>
+              <td>${t.docNo || ""}</td>
               <td>${t.service}</td>
               <td>${t.reqDept || ""}</td>
               <td>${t.reqDate || ""}</td>
               <td>${t.applyDate || ""}</td>
               <td><span class="badge" style="background:${STATUS_COLORS[t.status] || "#6b7280"}">${t.status}</span></td>
-            </tr>`).join("") || `<tr><td colspan="7">등록된 일정이 없습니다.</td></tr>`}
+            </tr>`).join("") || `<tr><td colspan="9">등록된 일정이 없습니다.</td></tr>`}
         </tbody>
       </table>
     </div>
     <div class="year-nav" style="margin-top:10px; justify-content:space-between;">
-      <span style="font-size:13px; color:#6b7280;">전체 ${filtered.length}건</span>
+      <span style="font-size:13px; color:#6b7280;">전체 ${filtered.length}건${selectedTaskIds.size > 0 ? ` · ${selectedTaskIds.size}건 선택됨` : ""}</span>
       ${filtered.length > LIST_PAGE_SIZE ? `
         <div style="display:flex; align-items:center; gap:12px;">
           <button id="prevListPageBtn" ${listPage <= 1 ? "disabled" : ""}>◀</button>
@@ -942,6 +1115,7 @@ function bindTabEvents() {
   } else if (tab === "calendar") {
     document.getElementById("prevM").onclick = () => { const d = new Date(ym.year, ym.month - 1, 1); ym = { year: d.getFullYear(), month: d.getMonth() }; render(); };
     document.getElementById("nextM").onclick = () => { const d = new Date(ym.year, ym.month + 1, 1); ym = { year: d.getFullYear(), month: d.getMonth() }; render(); };
+    document.getElementById("calBasisFilter").onchange = (e) => { calendarBasis = e.target.value; render(); };
     document.querySelectorAll(".cal-cell").forEach((c) => c.addEventListener("click", (e) => {
       if (e.target.closest(".cal-task")) return;
       openNew(c.dataset.date);
@@ -988,20 +1162,6 @@ function bindTabEvents() {
         dragState = null;
       });
     });
-    document.querySelectorAll(".addStageBtn").forEach((b) => b.onclick = async () => {
-      const label = prompt("새 단계 이름을 입력하세요", "새 단계");
-      if (!label) return;
-      const project = kpiProjects.find((p) => p.id === b.dataset.project);
-      const stages = [...(project.stages || []), { label, kpiName: "", start: "", end: "" }];
-      await kpiCol.doc(project.id).update({ stages });
-    });
-    document.querySelectorAll(".addStageFrontBtn").forEach((b) => b.onclick = async () => {
-      const label = prompt("새 단계 이름을 입력하세요", "새 단계");
-      if (!label) return;
-      const project = kpiProjects.find((p) => p.id === b.dataset.project);
-      const stages = [{ label, kpiName: "", start: "", end: "" }, ...(project.stages || [])];
-      await kpiCol.doc(project.id).update({ stages });
-    });
     document.querySelectorAll(".insertStageBtn").forEach((b) => b.addEventListener("click", async (e) => {
       e.stopPropagation();
       const label = prompt("추가할 단계 이름을 입력하세요", "새 단계");
@@ -1018,31 +1178,53 @@ function bindTabEvents() {
   } else {
     document.getElementById("addBtn").onclick = () => openNew(fmt(new Date()));
     const kwEl = document.getElementById("kw");
-    let isComposingKw = false;
-    kwEl.addEventListener("compositionstart", () => { isComposingKw = true; });
-    kwEl.addEventListener("compositionend", (e) => {
-      isComposingKw = false;
-      listFilter.keyword = e.target.value; listPage = 1; render();
-    });
     kwEl.oninput = (e) => {
       listFilter.keyword = e.target.value;
       listPage = 1;
-      if (!isComposingKw) render();
+      updateListResultsOnly();
     };
-    document.getElementById("statusFilter").onchange = (e) => { listFilter.status = e.target.value; listPage = 1; render(); };
-    document.getElementById("yearFilter").onchange = (e) => { listYear = e.target.value; listPage = 1; render(); };
+    document.getElementById("statusFilter").onchange = (e) => { listFilter.status = e.target.value; listPage = 1; updateListResultsOnly(); };
+    document.getElementById("yearFilter").onchange = (e) => { listYear = e.target.value; listPage = 1; updateListResultsOnly(); };
     document.getElementById("importBtn").onclick = () => document.getElementById("importFile").click();
-    document.getElementById("deleteAllBtn").onclick = () => deleteAllTasks();
+    document.getElementById("deleteAllBtn").onclick = () => deleteSelectedTasks();
     document.getElementById("importFile").onchange = (e) => {
       if (e.target.files[0]) handleImportFile(e.target.files[0]);
       e.target.value = "";
     };
-    const prevPageBtn = document.getElementById("prevListPageBtn");
-    const nextPageBtn = document.getElementById("nextListPageBtn");
-    if (prevPageBtn) prevPageBtn.onclick = () => { listPage--; render(); };
-    if (nextPageBtn) nextPageBtn.onclick = () => { listPage++; render(); };
-    document.querySelectorAll(".sheet tbody tr[data-id]").forEach((r) => r.onclick = () => openEdit(tasks.find((t) => t.id === r.dataset.id)));
+    bindListResultEvents();
   }
+}
+
+// 목록 탭 결과 영역(체크박스/행 클릭/페이지 이동)만 다시 그리고 이벤트를 다시 붙임.
+// 검색창(#kw)이 들어있는 툴바는 절대 건드리지 않으므로, 타이핑 중 IME 조합이 끊길 일이 없음.
+function updateListResultsOnly() {
+  const wrap = document.getElementById("listResultsWrap");
+  if (!wrap) return;
+  wrap.innerHTML = renderListResults();
+  bindListResultEvents();
+}
+function bindListResultEvents() {
+  const selectAllChk = document.getElementById("selectAllChk");
+  if (selectAllChk) selectAllChk.onchange = (e) => {
+    document.querySelectorAll(".rowChk").forEach((chk) => {
+      if (e.target.checked) selectedTaskIds.add(chk.dataset.id);
+      else selectedTaskIds.delete(chk.dataset.id);
+    });
+    updateListResultsOnly();
+  };
+  document.querySelectorAll(".rowChk").forEach((chk) => chk.addEventListener("change", (e) => {
+    if (e.target.checked) selectedTaskIds.add(chk.dataset.id);
+    else selectedTaskIds.delete(chk.dataset.id);
+    updateListResultsOnly();
+  }));
+  const prevPageBtn = document.getElementById("prevListPageBtn");
+  const nextPageBtn = document.getElementById("nextListPageBtn");
+  if (prevPageBtn) prevPageBtn.onclick = () => { listPage--; updateListResultsOnly(); };
+  if (nextPageBtn) nextPageBtn.onclick = () => { listPage++; updateListResultsOnly(); };
+  document.querySelectorAll(".sheet tbody tr[data-id]").forEach((r) => r.addEventListener("click", (e) => {
+    if (e.target.closest("input")) return;
+    openEdit(tasks.find((t) => t.id === r.dataset.id));
+  }));
 }
 
 /* ===== 간트차트 전용 팝업 ===== */
@@ -1051,8 +1233,9 @@ function bindNewProjectModalEvents() {
   document.getElementById("npCancelBtn").onclick = () => { newProjectModal = false; render(); };
   document.getElementById("npSaveBtn").onclick = async () => {
     const name = document.getElementById("np_name").value.trim() || "새 프로젝트";
-    const stages = FIXED_GANTT_ITEMS.map((label, idx) => ({
-      label, kpiName: "",
+    const stages = FIXED_GANTT_ITEMS.map((defaultLabel, idx) => ({
+      label: document.getElementById(`np_label_${idx}`).value.trim() || defaultLabel,
+      kpiName: "",
       start: document.getElementById(`np_start_${idx}`).value,
       end: document.getElementById(`np_end_${idx}`).value,
     }));
@@ -1254,8 +1437,6 @@ function bindModalEvents() {
   };
 }
 
-render();
-
 /* ===== 스크롤 위치 저장/복원 (새로고침해도 보던 위치 유지) ===== */
 window.addEventListener("beforeunload", () => {
   sessionStorage.setItem("scheduler_scroll", String(window.scrollY));
@@ -1272,6 +1453,8 @@ function maybeRestoreScroll() {
     requestAnimationFrame(() => requestAnimationFrame(() => window.scrollTo(0, y)));
   }
 }
+
+render();
 </script>
 </body>
 </html>
