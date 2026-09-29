@@ -214,6 +214,7 @@ let now = new Date();
 let ym = { year: now.getFullYear(), month: now.getMonth() };
 let calendarBasis = "req";   // 달력 조회 기준: "req"=요청일자, "apply"=적용일자
 let summaryYear = now.getFullYear();   // 대시보드 월별 집계표에서 조회 중인 연도
+let statusAsOfDate = null;   // "최근 개선 현황" 기준 시점(YYYY-MM-DD). null이면 오늘 기준
 let ganttYear = now.getFullYear();     // 장기 프로젝트 관리 탭에서 조회 중인 연도
 let modal = null;
 let kpiProjects = [];   // [{ id, name, stages: [{label, kpiName, start, end}, ...] }, ...]
@@ -225,15 +226,38 @@ let listPage = 1;
 let selectedTaskIds = new Set();
 const LIST_PAGE_SIZE = 50;
 
-/* ===== Firestore 실시간 구독 ===== */
-tasksCol.onSnapshot((snap) => {
-  tasks = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-  render();
-});
-kpiCol.onSnapshot((snap) => {
-  kpiProjects = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-  render();
-});
+/* ===== Firestore 실시간 구독 =====
+   중요: 구독이 실패해도(예: 보안 규칙 만료로 권한 거부) 절대 tasks/kpiProjects를 비우지 않는다.
+   화면이 "데이터가 없어짐"처럼 보이는 것을 막고, 대신 명확한 오류 배너를 띄운다. */
+let tasksLoaded = false;
+let kpiLoaded = false;
+let dbError = null;   // { code, message } - 하나라도 나면 배너로 표시
+
+tasksCol.onSnapshot(
+  (snap) => {
+    tasks = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    tasksLoaded = true;
+    if (dbError && dbError.source === "tasks") dbError = null;
+    render();
+  },
+  (err) => {
+    // tasks는 절대 덮어쓰지 않음(마지막으로 불러온 값 유지) - 실제 데이터 손실처럼 보이는 것을 방지
+    dbError = { source: "tasks", code: err.code, message: err.message };
+    render();
+  }
+);
+kpiCol.onSnapshot(
+  (snap) => {
+    kpiProjects = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    kpiLoaded = true;
+    if (dbError && dbError.source === "kpi") dbError = null;
+    render();
+  },
+  (err) => {
+    dbError = { source: "kpi", code: err.code, message: err.message };
+    render();
+  }
+);
 
 // 이전 버전(고정 10단계, 프로젝트 개념 없음)으로 등록해둔 데이터가 있으면 1회만 새 구조로 옮겨줌
 (async () => {
@@ -298,6 +322,61 @@ function computeDashboard() {
   return { thisMonth, monthly };
 }
 
+// 주간보고 엑셀의 "최근 개선 현황 (KPI제외)" 표와 동일한 로직 - 대시보드 화면에서도 재사용
+// 주간보고 엑셀의 "최근 개선 현황 (KPI제외)" 표와 동일한 로직 - 대시보드 화면에서도 재사용
+// asOfDate("YYYY-MM-DD")를 넘기면 그 시점 기준으로 계산: 해당 날짜 이후 접수된 건은 제외하고,
+// 완료여부는 "적용일자가 기준일 이전인 완료건만 완료로 집계"하는 방식으로 과거 시점 현황을 재구성한다.
+function computeRecentImprovementStatus(asOfDate) {
+  const asOf = asOfDate || fmt(new Date());
+  const nonKpiTasks = tasks.filter((t) => (t.docNo || "").trim() !== "KPI" && t.reqDate && t.reqDate <= asOf);
+  function isDoneAsOf(t) {
+    return t.status === "완료" && t.applyDate && t.applyDate <= asOf;
+  }
+  function lastNMonthKeys(n) {
+    const arr = [];
+    const [ay, am] = asOf.split("-").map(Number);
+    for (let i = 0; i < n; i++) {
+      const d = new Date(ay, am - 1 - i, 1);
+      arr.unshift(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`);
+    }
+    return arr;
+  }
+  function monthKeyAddOffset(key, offset) {
+    const [y, m] = key.split("-").map(Number);
+    const d = new Date(y, m - 1 + offset, 1);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+  }
+  const byMonth = {};
+  nonKpiTasks.forEach((t) => {
+    const key = t.reqDate.slice(0, 7);
+    const m = (byMonth[key] ??= { requested: 0, inProgress: 0, done: 0 });
+    m.requested++;
+    if (isDoneAsOf(t)) m.done++; else m.inProgress++;
+  });
+  function monthHasInProgress(key) {
+    return nonKpiTasks.some((t) => t.reqDate.slice(0, 7) === key && !isDoneAsOf(t));
+  }
+  let keys = lastNMonthKeys(3);
+  for (let guard = 0; guard < 36; guard++) {
+    const prevKey = monthKeyAddOffset(keys[0], -1);
+    if (monthHasInProgress(prevKey)) keys.unshift(prevKey);
+    else break;
+  }
+  const rows = keys.map((key) => {
+    const m = byMonth[key] || { requested: 0, inProgress: 0, done: 0 };
+    const rate = m.requested ? Math.round((m.done / m.requested) * 100) : 0;
+    return { key, label: `${key.slice(0, 4)}년 ${Number(key.slice(5, 7))}월`, requested: m.requested, inProgress: m.inProgress, done: m.done, rate };
+  });
+  const curYear = asOf.slice(0, 4);
+  const yearTasks = nonKpiTasks.filter((t) => t.reqDate.slice(0, 4) === curYear);
+  const yReq = yearTasks.length;
+  const yDone = yearTasks.filter((t) => isDoneAsOf(t)).length;
+  const yProg = yReq - yDone;
+  const yRate = yReq ? Math.round((yDone / yReq) * 100) : 0;
+  const cumulative = { label: `${curYear}년 누적`, requested: yReq, inProgress: yProg, done: yDone, rate: yRate };
+  return { rows, cumulative, asOf };
+}
+
 /* ===== 엑셀 다운로드 (서식 포함) ===== */
 async function exportWeeklyReport() {
   const { monthly } = computeDashboard();
@@ -357,10 +436,17 @@ async function exportWeeklyReport() {
   const monthlyMap = Object.fromEntries(monthly.map((m) => [m.month, m]));
   addTitleRow(sSheet, "최근 3개월 현황", 5);
   addRow(sSheet, ["월", "개발요청건", "진행중", "완료건", "완료율"], "title");
-  lastNMonthKeys(3).forEach((key) => {
-    const m = monthlyMap[key] || { requested: 0, inProgress: 0, done: 0, doneRate: 0 };
+  const summaryLast3 = lastNMonthKeys(3).map((key) => ({ key, m: monthlyMap[key] || { requested: 0, inProgress: 0, done: 0, doneRate: 0 } }));
+  summaryLast3.forEach(({ key, m }) => {
     addRow(sSheet, [`${key.slice(0, 4)}년 ${Number(key.slice(5, 7))}월`, m.requested, m.inProgress, m.done, `${m.doneRate}%`], "center");
   });
+  {
+    const sReq = summaryLast3.reduce((s, x) => s + x.m.requested, 0);
+    const sProg = summaryLast3.reduce((s, x) => s + x.m.inProgress, 0);
+    const sDone = summaryLast3.reduce((s, x) => s + x.m.done, 0);
+    const sRate = sReq ? Math.round((sDone / sReq) * 100) : 0;
+    addRow(sSheet, ["합계", sReq, sProg, sDone, `${sRate}%`], "label");
+  }
   sSheet.addRow([]);
 
   // 연도별 월별 집계 (대시보드와 동일하게 연도별 합계 행 포함)
@@ -385,26 +471,15 @@ async function exportWeeklyReport() {
   // 주간보고 시트: 요약 시트의 '최근 3개월 현황'과 같은 형식이되, 관련 문서번호가 'KPI'인 건은 집계에서 제외
   const wSheet = wb.addWorksheet("주간보고");
   const nonKpiTasks = tasks.filter((t) => (t.docNo || "").trim() !== "KPI");
-  function computeMonthlyFrom(list) {
-    const byMonth = {};
-    list.forEach((t) => {
-      const key = t.reqDate ? t.reqDate.slice(0, 7) : null;
-      if (!key) return;
-      const m = (byMonth[key] ??= { requested: 0, inProgress: 0, done: 0 });
-      m.requested++;
-      if (t.status === "완료") m.done++; else m.inProgress++;
-    });
-    return byMonth;
-  }
-  const nonKpiByMonth = computeMonthlyFrom(nonKpiTasks);
-  addTitleRow(wSheet, "최근 3개월 현황 (KPI 제외)", 5);
-  addRow(wSheet, ["월", "개발요청건", "진행중", "완료건", "완료율"], "title");
+  const recentStatus = computeRecentImprovementStatus();
+
+  addTitleRow(wSheet, "최근 개선 현황 (KPI제외)", 5);
+  addRow(wSheet, ["구분", "접수", "진행", "완료", "완료율"], "title");
   const last3Keys = lastNMonthKeys(3);
-  last3Keys.forEach((key) => {
-    const m = nonKpiByMonth[key] || { requested: 0, inProgress: 0, done: 0 };
-    const rate = m.requested ? Math.round((m.done / m.requested) * 100) : 0;
-    addRow(wSheet, [`${key.slice(0, 4)}년 ${Number(key.slice(5, 7))}월`, m.requested, m.inProgress, m.done, `${rate}%`], "center");
+  recentStatus.rows.forEach((r) => {
+    addRow(wSheet, [r.label, r.requested, r.inProgress, r.done, `${r.rate}%`], "center");
   });
+  addRow(wSheet, [recentStatus.cumulative.label, recentStatus.cumulative.requested, recentStatus.cumulative.inProgress, recentStatus.cumulative.done, `${recentStatus.cumulative.rate}%`], "label");
 
   // 최근 3개월 일정목록 (현황 표와 1행 띄우고 표시) - 그룹 헤더 3개 + 완료여부만, 지정된 항목만 포함, KPI 제외
   wSheet.addRow([]);
@@ -608,8 +683,9 @@ function extractRecordsFromSheet(sheet) {
     rec.workDesign = rec.workDesign || "없음";
     rec.screenDesign = rec.screenDesign || "없음";
     rec.cfRequest = rec.cfRequest || "N";
-    rec.status = rec.status || "진행";
-    if (!rec.reqDate || !rec.applyDate) rec.status = "대기중";   // 요청일자/적용일자 공란이면 대기중
+    // 완료여부는 엑셀에 값이 있으면 그 값을 그대로 존중한다.
+    // 엑셀에 완료여부가 비어있을 때만 자동 판단: 요청일자/적용일자가 없으면 "대기중", 있으면 "진행"
+    if (!rec.status) rec.status = (!rec.reqDate || !rec.applyDate) ? "대기중" : "진행";
     return rec;
   }).filter(Boolean);
 }
@@ -634,23 +710,64 @@ async function handleImportFile(file) {
   wb.SheetNames.forEach((name) => { allRecs = allRecs.concat(extractRecordsFromSheet(wb.Sheets[name])); });
   if (allRecs.length === 0) { alert("엑셀 안에서 '요청일자' 컬럼을 찾지 못했어요. 파일 형식을 확인해주세요."); return; }
 
-  const existingSigs = new Set(tasks.map(taskSignature));
+  // 식별자(요청일자+요청부서+요청자+일정명+서비스코드)로 기존 일정을 매핑해두고,
+  // 같은 일정이 발견되면 완료여부/적용일자 등 달라진 항목만 골라 기존 일정을 업데이트한다.
+  const existingBySig = new Map();
+  tasks.forEach((t) => existingBySig.set(taskSignature(t), t));
+
   const toAdd = [];
-  let skipped = 0;
+  const toUpdate = [];   // [{ id, data }]
+  let unchanged = 0;
+
   allRecs.forEach((rec) => {
     const sig = taskSignature(rec);
-    if (existingSigs.has(sig)) { skipped++; return; }
-    existingSigs.add(sig);
-    toAdd.push(rec);
+    const matched = existingBySig.get(sig);
+
+    if (matched && matched.__pendingAdd) {
+      // 이번 파일 안에서 같은 일정이 여러 번 나온 경우 - 새로 등록 예정인 레코드에 최신 값을 덮어씀
+      Object.assign(matched, rec);
+      return;
+    }
+    if (matched) {
+      // 이미 등록된 일정 - 값이 달라진 항목만 뽑아 업데이트 대상으로
+      const diff = {};
+      Object.keys(rec).forEach((k) => {
+        if (String(rec[k] ?? "") !== String(matched[k] ?? "")) diff[k] = rec[k];
+      });
+      if (Object.keys(diff).length > 0) {
+        let entry = toUpdate.find((u) => u.id === matched.id);
+        if (!entry) { entry = { id: matched.id, data: {} }; toUpdate.push(entry); }
+        Object.assign(entry.data, diff);
+        Object.assign(matched, diff);   // 로컬 비교 기준값도 갱신(같은 파일 내 후속 중복 대비)
+      } else {
+        unchanged++;
+      }
+      return;
+    }
+    const newRec = { ...rec, __pendingAdd: true };
+    toAdd.push(newRec);
+    existingBySig.set(sig, newRec);
   });
 
   const CHUNK = 400;   // Firestore 배치는 최대 500건, 여유있게 400건씩 나눠 커밋
   for (let i = 0; i < toAdd.length; i += CHUNK) {
     const batch = db.batch();
-    toAdd.slice(i, i + CHUNK).forEach((rec) => batch.set(tasksCol.doc(), rec));
+    toAdd.slice(i, i + CHUNK).forEach((rec) => {
+      const { __pendingAdd, ...data } = rec;
+      batch.set(tasksCol.doc(), data);
+    });
     await batch.commit();
   }
-  alert(`${toAdd.length}건의 일정을 등록했습니다.${skipped > 0 ? `\n(중복으로 판단되어 ${skipped}건은 건너뛰었습니다)` : ""}`);
+  for (let i = 0; i < toUpdate.length; i += CHUNK) {
+    const batch = db.batch();
+    toUpdate.slice(i, i + CHUNK).forEach((u) => batch.update(tasksCol.doc(u.id), u.data));
+    await batch.commit();
+  }
+
+  const parts = [`${toAdd.length}건 신규 등록`];
+  if (toUpdate.length > 0) parts.push(`${toUpdate.length}건 정보 갱신(업데이트)`);
+  if (unchanged > 0) parts.push(`${unchanged}건은 변동사항 없어 그대로 둠`);
+  alert(parts.join(", ") + "했습니다.");
 }
 
 /* ===== 렌더링 ===== */
@@ -678,6 +795,11 @@ function render() {
   if (kpiModal) KPI_FIELD_IDS.forEach((id) => { const el = document.getElementById(id); if (el) fieldDraft[id] = el.value; });
   if (newProjectModal) document.querySelectorAll('[id^="np_"]').forEach((el) => { fieldDraft[el.id] = el.value; });
 
+  // 팝업 편집 중(잠금 하트비트, 접속자 표시 등으로) 20초마다 화면이 통째로 다시 그려지면서
+  // 팝업 내부 스크롤이 맨 위로 튕겨 올라가는 문제 방지 - 스크롤 위치를 기억했다가 그대로 복원
+  const modalScrollTop = document.getElementById("modalBox")?.scrollTop;
+  const pageScrollY = window.scrollY;
+
   const root = document.getElementById("root");
   root.innerHTML = `
     <aside class="sidebar">
@@ -702,6 +824,18 @@ function render() {
           <span class="user-tag">${esc(userName)} 님</span>
         </div>
       </header>
+      ${dbError ? `
+        <div style="background:#fef2f2; border:1px solid #fca5a5; color:#991b1b; border-radius:8px; padding:14px 16px; margin-bottom:16px; line-height:1.6;">
+          <strong>⚠ 데이터를 서버에서 불러오지 못하고 있어요 (${esc(dbError.code || "오류")})</strong><br/>
+          지금 화면에 일정이 없거나 이상하게 보여도 <u>실제로 데이터가 삭제된 것이 아닐 가능성이 높습니다.</u>
+          대부분 Firebase 보안 규칙(테스트 모드) 만료로 접근이 막힌 경우입니다.<br/>
+          Firebase 콘솔 → Firestore Database → 규칙 탭에서 만료일을 확인하고 규칙을 갱신해주세요.
+        </div>
+      ` : (!tasksLoaded ? `
+        <div style="background:#eff6ff; border:1px solid #bfdbfe; color:#1e40af; border-radius:8px; padding:10px 16px; margin-bottom:16px;">
+          데이터를 불러오는 중입니다...
+        </div>
+      ` : "")}
       <input type="file" id="importFile" accept=".xlsx,.xls" style="display:none;" />
       <div id="tabContent"></div>
       ${modal ? renderModal() : ""}
@@ -746,6 +880,13 @@ function render() {
     }
   }
   maybeRestoreScroll();
+
+  // 팝업(모달) 내부 스크롤 및 페이지 스크롤 위치 복원
+  if (modal && typeof modalScrollTop === "number") {
+    const mb = document.getElementById("modalBox");
+    if (mb) mb.scrollTop = modalScrollTop;
+  }
+  if (pageScrollY > 0) window.scrollTo(0, pageScrollY);
 }
 
 function statCard(label, value, red, note) {
@@ -766,6 +907,7 @@ function renderDashboard() {
     : "#e5e7eb";
 
   const recent = [...tasks].sort((a, b) => (b.reqDate || "").localeCompare(a.reqDate || "")).slice(0, 8);
+  const recentStatus = computeRecentImprovementStatus(statusAsOfDate || null);
 
   return `
     <div style="display:flex; justify-content:flex-end; gap:8px; margin-bottom:14px;">
@@ -836,6 +978,45 @@ function renderDashboard() {
       </div>
     </div>
     <div class="card">
+      <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; margin-bottom:12px;">
+        <h3 style="margin:0;">최근 개선 현황 (KPI제외)</h3>
+        <label style="font-size:12px; color:#6b7280; display:flex; align-items:center; gap:6px;">기준 시점
+          <input type="date" id="statusAsOfInput" value="${recentStatus.asOf}" />
+          <button id="statusAsOfTodayBtn" style="font-size:12px; padding:3px 8px;">오늘</button>
+        </label>
+      </div>
+      <table class="month-table">
+        <thead><tr><th>구분</th><th>접수</th><th>진행</th><th>완료</th><th>완료율</th></tr></thead>
+        <tbody>
+          ${recentStatus.rows.map((r) => `
+            <tr>
+              <td>${r.label}</td>
+              <td>${r.requested}</td>
+              <td style="color:#2563eb;">${r.inProgress}</td>
+              <td>${r.done}</td>
+              <td style="text-align:left;">
+                <div class="rate-cell">
+                  <div class="rate-bar"><div class="rate-bar-fill" style="width:${r.rate}%;"></div></div>
+                  <span class="rate-text">${r.rate}%</span>
+                </div>
+              </td>
+            </tr>`).join("") || `<tr><td colspan="5">데이터가 없습니다.</td></tr>`}
+          <tr style="font-weight:600; background:#f3f4f6;">
+            <td>${recentStatus.cumulative.label}</td>
+            <td>${recentStatus.cumulative.requested}</td>
+            <td style="color:#2563eb;">${recentStatus.cumulative.inProgress}</td>
+            <td>${recentStatus.cumulative.done}</td>
+            <td style="text-align:left;">
+              <div class="rate-cell">
+                <div class="rate-bar"><div class="rate-bar-fill" style="width:${recentStatus.cumulative.rate}%;"></div></div>
+                <span class="rate-text">${recentStatus.cumulative.rate}%</span>
+              </div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="card">
       <h3>최근 등록 일정</h3>
       <table class="recent-table">
         <thead><tr><th>일정명</th><th>서비스구분</th><th>요청부서</th><th>적용일자</th><th>상태</th></tr></thead>
@@ -858,8 +1039,17 @@ function renderCalendar() {
   const byDate = {};
   tasks.forEach((t) => {
     const d = t[dateField];
-    if (d) (byDate[d] ??= []).push(t);
+    if (d) (byDate[d] ??= []).push({ task: t, upcoming: false });
   });
+  // 적용일자 기준으로 조회 중일 때, 완료여부 "진행"인 일정은 협의일자에도
+  // "적용 예정 일정"으로 주황색 표시를 추가한다(기존 적용일자 표시는 그대로 유지)
+  if (calendarBasis === "apply") {
+    tasks.forEach((t) => {
+      if (t.status === "진행" && t.meetingDate) {
+        (byDate[t.meetingDate] ??= []).push({ task: t, upcoming: true });
+      }
+    });
+  }
   return `
     <header class="cal-header">
       <button id="prevM">◀</button>
@@ -877,6 +1067,10 @@ function renderCalendar() {
         <span style="display:inline-block; width:9px; height:9px; border-radius:2px; background:#2563eb; margin-right:4px;"></span>진행중인 일정
         &nbsp;&nbsp;
         <span style="display:inline-block; width:9px; height:9px; border-radius:2px; background:#16a34a; margin-right:4px;"></span>완료된 일정
+        ${calendarBasis === "apply" ? `
+        &nbsp;&nbsp;
+        <span style="display:inline-block; width:9px; height:9px; border-radius:2px; background:#f97316; margin-right:4px;"></span>적용 예정 일정(협의일자)
+        ` : ""}
       </span>
     </div>
     <div class="cal-grid">
@@ -884,8 +1078,8 @@ function renderCalendar() {
       ${grid.map((c) => `
         <div class="cal-cell ${c.inMonth ? "" : "dim"}" data-date="${c.date}">
           <div class="cal-day">${c.day}</div>
-          ${(byDate[c.date] || []).map((t) => `
-            <button class="cal-task ${isLocked(t) ? "locked" : ""}" data-id="${t.id}" style="background:${STATUS_COLORS[t.status] || "#6b7280"}">${esc(t.title)}</button>
+          ${(byDate[c.date] || []).map((entry) => `
+            <button class="cal-task ${isLocked(entry.task) ? "locked" : ""}" data-id="${entry.task.id}" style="background:${entry.upcoming ? "#f97316" : (STATUS_COLORS[entry.task.status] || "#6b7280")}">${esc(entry.task.title)}</button>
           `).join("")}
         </div>`).join("")}
     </div>`;
@@ -1119,6 +1313,8 @@ function bindTabEvents() {
     document.getElementById("nextYearBtn").onclick = () => { summaryYear++; render(); };
     document.getElementById("exportBtn").onclick = () => exportWeeklyReport();
     document.querySelectorAll(".recent-table tbody tr[data-id]").forEach((r) => r.onclick = () => openEdit(tasks.find((t) => t.id === r.dataset.id)));
+    document.getElementById("statusAsOfInput").onchange = (e) => { statusAsOfDate = e.target.value || null; render(); };
+    document.getElementById("statusAsOfTodayBtn").onclick = () => { statusAsOfDate = null; render(); };
   } else if (tab === "calendar") {
     document.getElementById("prevM").onclick = () => { const d = new Date(ym.year, ym.month - 1, 1); ym = { year: d.getFullYear(), month: d.getMonth() }; render(); };
     document.getElementById("nextM").onclick = () => { const d = new Date(ym.year, ym.month + 1, 1); ym = { year: d.getFullYear(), month: d.getMonth() }; render(); };
@@ -1358,7 +1554,7 @@ function renderModal() {
           <div class="row">
             <label>협의일자<input type="date" id="f_meetingDate" value="${t.meetingDate || ""}" /></label>
             <label>적용일자<input type="date" id="f_applyDate" value="${t.applyDate || ""}" /></label>
-            <label>완료여부<select id="f_status">${STATUS_VALUES.map((v) => `<option ${v === (t.status || "진행") ? "selected" : ""}>${v}</option>`).join("")}</select></label>
+            <label>완료여부<select id="f_status">${STATUS_VALUES.map((v) => `<option ${v === (t.status || (!t.reqDate && !t.applyDate ? "대기중" : "진행")) ? "selected" : ""}>${v}</option>`).join("")}</select></label>
           </div>
 
           <label>메모<textarea id="f_memo" rows="2">${esc(t.memo || "")}</textarea></label>
@@ -1432,7 +1628,7 @@ function bindModalEvents() {
       status: document.getElementById("f_status").value,
       memo: document.getElementById("f_memo").value,
     };
-    if (!data.reqDate || !data.applyDate) data.status = "대기중";   // 요청일자/적용일자 공란이면 대기중
+    // 완료여부는 사용자가 드롭박스에서 선택한 값을 그대로 저장한다 (요청일자/적용일자가 비어있다고 임의로 덮어쓰지 않음)
     if (modal.task) {
       stopLockHeartbeat();
       data.editingBy = firebase.firestore.FieldValue.delete();
