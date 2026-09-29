@@ -220,6 +220,7 @@ let modal = null;
 let kpiProjects = [];   // [{ id, name, stages: [{label, kpiName, start, end}, ...] }, ...]
 let kpiModal = null;    // { projectId, stageIdx }
 let newProjectModal = false;   // 새 프로젝트 추가 팝업 (프로젝트명 + 기본단계 일자)
+let statusDetailPopup = null;   // { label, kind: "progress"|"done", tasks: [...] } - 대시보드 "최근 개선 현황" 행 클릭 시 상세 목록 팝업
 let listFilter = { status: "전체", keyword: "" };
 let listYear = "전체";
 let listPage = 1;
@@ -322,16 +323,17 @@ function computeDashboard() {
   return { thisMonth, monthly };
 }
 
-// 주간보고 엑셀의 "최근 개선 현황 (KPI제외)" 표와 동일한 로직 - 대시보드 화면에서도 재사용
+// 완료여부 판정 공용 함수 - "완료"이고 적용일자가 기준일 이전이어야 그 시점 기준 완료로 인정
+function isTaskDoneAsOf(t, asOf) {
+  return (t.status || "").trim() === "완료" && t.applyDate && t.applyDate <= asOf;
+}
 // 주간보고 엑셀의 "최근 개선 현황 (KPI제외)" 표와 동일한 로직 - 대시보드 화면에서도 재사용
 // asOfDate("YYYY-MM-DD")를 넘기면 그 시점 기준으로 계산: 해당 날짜 이후 접수된 건은 제외하고,
 // 완료여부는 "적용일자가 기준일 이전인 완료건만 완료로 집계"하는 방식으로 과거 시점 현황을 재구성한다.
 function computeRecentImprovementStatus(asOfDate) {
   const asOf = asOfDate || fmt(new Date());
-  const nonKpiTasks = tasks.filter((t) => (t.docNo || "").trim() !== "KPI" && t.reqDate && t.reqDate <= asOf);
-  function isDoneAsOf(t) {
-    return t.status === "완료" && t.applyDate && t.applyDate <= asOf;
-  }
+  const nonKpiTasks = tasks.filter((t) => (t.docNo || "").trim().toUpperCase() !== "KPI" && t.reqDate && t.reqDate <= asOf);
+  const isDoneAsOf = (t) => isTaskDoneAsOf(t, asOf);
   function lastNMonthKeys(n) {
     const arr = [];
     const [ay, am] = asOf.split("-").map(Number);
@@ -349,9 +351,10 @@ function computeRecentImprovementStatus(asOfDate) {
   const byMonth = {};
   nonKpiTasks.forEach((t) => {
     const key = t.reqDate.slice(0, 7);
-    const m = (byMonth[key] ??= { requested: 0, inProgress: 0, done: 0 });
+    const m = (byMonth[key] ??= { requested: 0, inProgress: 0, done: 0, tasks: [] });
     m.requested++;
     if (isDoneAsOf(t)) m.done++; else m.inProgress++;
+    m.tasks.push(t);
   });
   function monthHasInProgress(key) {
     return nonKpiTasks.some((t) => t.reqDate.slice(0, 7) === key && !isDoneAsOf(t));
@@ -363,9 +366,9 @@ function computeRecentImprovementStatus(asOfDate) {
     else break;
   }
   const rows = keys.map((key) => {
-    const m = byMonth[key] || { requested: 0, inProgress: 0, done: 0 };
+    const m = byMonth[key] || { requested: 0, inProgress: 0, done: 0, tasks: [] };
     const rate = m.requested ? Math.round((m.done / m.requested) * 100) : 0;
-    return { key, label: `${key.slice(0, 4)}년 ${Number(key.slice(5, 7))}월`, requested: m.requested, inProgress: m.inProgress, done: m.done, rate };
+    return { key, label: `${key.slice(0, 4)}년 ${Number(key.slice(5, 7))}월`, requested: m.requested, inProgress: m.inProgress, done: m.done, rate, tasks: m.tasks };
   });
   const curYear = asOf.slice(0, 4);
   const yearTasks = nonKpiTasks.filter((t) => t.reqDate.slice(0, 4) === curYear);
@@ -373,7 +376,7 @@ function computeRecentImprovementStatus(asOfDate) {
   const yDone = yearTasks.filter((t) => isDoneAsOf(t)).length;
   const yProg = yReq - yDone;
   const yRate = yReq ? Math.round((yDone / yReq) * 100) : 0;
-  const cumulative = { label: `${curYear}년 누적`, requested: yReq, inProgress: yProg, done: yDone, rate: yRate };
+  const cumulative = { label: `${curYear}년 누적`, requested: yReq, inProgress: yProg, done: yDone, rate: yRate, tasks: yearTasks };
   return { rows, cumulative, asOf };
 }
 
@@ -470,7 +473,7 @@ async function exportWeeklyReport() {
 
   // 주간보고 시트: 요약 시트의 '최근 3개월 현황'과 같은 형식이되, 관련 문서번호가 'KPI'인 건은 집계에서 제외
   const wSheet = wb.addWorksheet("주간보고");
-  const nonKpiTasks = tasks.filter((t) => (t.docNo || "").trim() !== "KPI");
+  const nonKpiTasks = tasks.filter((t) => (t.docNo || "").trim().toUpperCase() !== "KPI");
   const recentStatus = computeRecentImprovementStatus();
 
   addTitleRow(wSheet, "최근 개선 현황 (KPI제외)", 5);
@@ -514,8 +517,12 @@ async function exportWeeklyReport() {
   subRow.getCell(11).border = BORDER;
 
   const last3Set = new Set(last3Keys);
+  const extendedKeys = recentStatus.rows.map((r) => r.key).filter((k) => !last3Set.has(k));
   const recentList = nonKpiTasks
-    .filter((t) => t.reqDate && last3Set.has(t.reqDate.slice(0, 7)))
+    .filter((t) => t.reqDate && (
+      last3Set.has(t.reqDate.slice(0, 7)) ||
+      (extendedKeys.includes(t.reqDate.slice(0, 7)) && !isTaskDoneAsOf(t, recentStatus.asOf))
+    ))
     .sort((a, b) => (a.reqDate || "").localeCompare(b.reqDate || ""));
   recentList.forEach((t, i) => {
     const row = addRow(wSheet, [
@@ -841,6 +848,7 @@ function render() {
       ${modal ? renderModal() : ""}
       ${kpiModal ? renderKpiModal() : ""}
       ${newProjectModal ? renderNewProjectModal() : ""}
+      ${statusDetailPopup ? renderStatusDetailModal() : ""}
     </main>
   `;
 
@@ -861,6 +869,7 @@ function render() {
   if (modal) bindModalEvents();
   if (kpiModal) bindKpiModalEvents();
   if (newProjectModal) bindNewProjectModalEvents();
+  if (statusDetailPopup) bindStatusDetailModalEvents();
 
   Object.entries(fieldDraft).forEach(([id, val]) => {
     const el = document.getElementById(id);
@@ -988,12 +997,12 @@ function renderDashboard() {
       <table class="month-table">
         <thead><tr><th>구분</th><th>접수</th><th>진행</th><th>완료</th><th>완료율</th></tr></thead>
         <tbody>
-          ${recentStatus.rows.map((r) => `
+          ${recentStatus.rows.map((r, idx) => `
             <tr>
               <td>${r.label}</td>
-              <td>${r.requested}</td>
-              <td style="color:#2563eb;">${r.inProgress}</td>
-              <td>${r.done}</td>
+              <td class="sd-cell" data-row-idx="${idx}" data-kind="all" style="text-decoration:underline; cursor:pointer;">${r.requested}</td>
+              <td class="sd-cell" data-row-idx="${idx}" data-kind="progress" style="color:#2563eb; text-decoration:underline; cursor:pointer;">${r.inProgress}</td>
+              <td class="sd-cell" data-row-idx="${idx}" data-kind="done" style="text-decoration:underline; cursor:pointer;">${r.done}</td>
               <td style="text-align:left;">
                 <div class="rate-cell">
                   <div class="rate-bar"><div class="rate-bar-fill" style="width:${r.rate}%;"></div></div>
@@ -1003,9 +1012,9 @@ function renderDashboard() {
             </tr>`).join("") || `<tr><td colspan="5">데이터가 없습니다.</td></tr>`}
           <tr style="font-weight:600; background:#f3f4f6;">
             <td>${recentStatus.cumulative.label}</td>
-            <td>${recentStatus.cumulative.requested}</td>
-            <td style="color:#2563eb;">${recentStatus.cumulative.inProgress}</td>
-            <td>${recentStatus.cumulative.done}</td>
+            <td class="sd-cell" data-row-idx="cumulative" data-kind="all" style="text-decoration:underline; cursor:pointer;">${recentStatus.cumulative.requested}</td>
+            <td class="sd-cell" data-row-idx="cumulative" data-kind="progress" style="color:#2563eb; text-decoration:underline; cursor:pointer;">${recentStatus.cumulative.inProgress}</td>
+            <td class="sd-cell" data-row-idx="cumulative" data-kind="done" style="text-decoration:underline; cursor:pointer;">${recentStatus.cumulative.done}</td>
             <td style="text-align:left;">
               <div class="rate-cell">
                 <div class="rate-bar"><div class="rate-bar-fill" style="width:${recentStatus.cumulative.rate}%;"></div></div>
@@ -1015,7 +1024,9 @@ function renderDashboard() {
           </tr>
         </tbody>
       </table>
+      <p style="font-size:11px; color:#9ca3af; margin:8px 0 0;">행을 클릭하면 해당 진행/완료 일정 목록을 볼 수 있어요.</p>
     </div>
+
     <div class="card">
       <h3>최근 등록 일정</h3>
       <table class="recent-table">
@@ -1214,6 +1225,37 @@ function renderNewProjectModal() {
       </div>
     </div>`;
 }
+function renderStatusDetailModal() {
+  const list = [...(statusDetailPopup.tasks || [])].sort((a, b) => (a.reqDate || "").localeCompare(b.reqDate || ""));
+  const asOf = statusDetailPopup.asOf;
+  return `
+    <div class="modal-backdrop" id="sdBackdrop">
+      <div class="modal" style="width:640px;">
+        <h2>${esc(statusDetailPopup.label)} 일정 목록</h2>
+        <div style="max-height:420px; overflow-y:auto;">
+          <table class="month-table">
+            <thead><tr><th>NO</th><th>요청일자</th><th>일정명</th><th>완료여부</th><th>적용일자</th></tr></thead>
+            <tbody>
+              ${list.map((t, i) => {
+                const done = isTaskDoneAsOf(t, asOf);
+                return `
+                <tr class="sd-task-row" data-id="${t.id}" style="cursor:pointer;">
+                  <td style="white-space:nowrap;">${i + 1}</td>
+                  <td style="white-space:nowrap;">${t.reqDate || ""}</td>
+                  <td style="text-align:left;">${esc(t.title || "")}</td>
+                  <td style="white-space:nowrap;"><span style="display:inline-block; padding:2px 8px; border-radius:10px; font-size:12px; color:#fff; background:${done ? "#16a34a" : "#2563eb"};">${done ? "완료" : "진행"}</span></td>
+                  <td style="white-space:nowrap;">${t.applyDate || "-"}</td>
+                </tr>`;
+              }).join("") || `<tr><td colspan="5">해당하는 일정이 없습니다.</td></tr>`}
+            </tbody>
+          </table>
+        </div>
+        <div class="modal-actions">
+          <button id="sdCloseBtn">닫기</button>
+        </div>
+      </div>
+    </div>`;
+}
 function renderKpiModal() {
   const project = kpiProjects.find((p) => p.id === kpiModal.projectId);
   const item = (project?.stages || [])[kpiModal.stageIdx] || {};
@@ -1315,6 +1357,23 @@ function bindTabEvents() {
     document.querySelectorAll(".recent-table tbody tr[data-id]").forEach((r) => r.onclick = () => openEdit(tasks.find((t) => t.id === r.dataset.id)));
     document.getElementById("statusAsOfInput").onchange = (e) => { statusAsOfDate = e.target.value || null; render(); };
     document.getElementById("statusAsOfTodayBtn").onclick = () => { statusAsOfDate = null; render(); };
+    {
+      const rs = computeRecentImprovementStatus(statusAsOfDate || null);
+      document.querySelectorAll(".sd-cell").forEach((cell) => {
+        cell.onclick = () => {
+          const idx = cell.dataset.rowIdx;
+          const kind = cell.dataset.kind;   // "all" | "progress" | "done"
+          const row = idx === "cumulative" ? rs.cumulative : rs.rows[Number(idx)];
+          if (!row) return;
+          let list = row.tasks || [];
+          if (kind === "progress") list = list.filter((t) => !isTaskDoneAsOf(t, rs.asOf));
+          else if (kind === "done") list = list.filter((t) => isTaskDoneAsOf(t, rs.asOf));
+          const kindLabel = kind === "progress" ? "진행" : kind === "done" ? "완료" : "접수(진행+완료)";
+          statusDetailPopup = { label: `${row.label} - ${kindLabel}`, tasks: list, asOf: rs.asOf };
+          render();
+        };
+      });
+    }
   } else if (tab === "calendar") {
     document.getElementById("prevM").onclick = () => { const d = new Date(ym.year, ym.month - 1, 1); ym = { year: d.getFullYear(), month: d.getMonth() }; render(); };
     document.getElementById("nextM").onclick = () => { const d = new Date(ym.year, ym.month + 1, 1); ym = { year: d.getFullYear(), month: d.getMonth() }; render(); };
@@ -1448,6 +1507,16 @@ function bindNewProjectModalEvents() {
 }
 function openKpiModal(projectId, stageIdx) { kpiModal = { projectId, stageIdx }; render(); }
 function closeKpiModal() { kpiModal = null; render(); }
+function bindStatusDetailModalEvents() {
+  document.getElementById("sdBackdrop").addEventListener("click", (e) => { if (e.target.id === "sdBackdrop") { statusDetailPopup = null; render(); } });
+  document.getElementById("sdCloseBtn").onclick = () => { statusDetailPopup = null; render(); };
+  document.querySelectorAll(".sd-task-row").forEach((r) => r.onclick = () => {
+    const t = tasks.find((x) => x.id === r.dataset.id);
+    statusDetailPopup = null;
+    if (t) openEdit(t);
+    else render();
+  });
+}
 function bindKpiModalEvents() {
   document.getElementById("kpiBackdrop").addEventListener("click", (e) => { if (e.target.id === "kpiBackdrop") closeKpiModal(); });
   document.getElementById("kpiCancelBtn").onclick = closeKpiModal;
